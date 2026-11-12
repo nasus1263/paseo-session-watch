@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import type { PaseoApi } from "@getpaseo/client";
 import { exhaustedUntil } from "../shared/limit";
 import type { AgentRow } from "../shared/plan";
+import { claudeOutstandingTasks } from "./claude-sessions";
 import type { Gateway } from "./engine";
 
 const SHUTDOWN_COMMENT = "Paseo 세션 감시: 모든 작업이 끝나 60초 후 PC를 종료합니다.";
@@ -27,6 +28,8 @@ export function paseoGateway(paseo: PaseoApi): Gateway {
         lastError: a.lastError ?? null,
         pendingPermissions: a.pendingPermissions?.length ?? 0,
         archived: Boolean(a.archivedAt),
+        updatedAt: a.updatedAt ?? null,
+        sessionId: a.runtimeInfo?.sessionId ?? a.persistence?.sessionId ?? null,
       };
     },
 
@@ -66,6 +69,12 @@ export function paseoGateway(paseo: PaseoApi): Gateway {
       return exhaustedUntil(windows);
     },
 
+    async activity(id, info) {
+      const background =
+        info.provider === "claude" && info.sessionId ? await claudeOutstandingTasks(info.sessionId) : null;
+      return { background, busyChildren: await busyDescendants(paseo, id) };
+    },
+
     shutdown: () => run("shutdown", ["/s", "/t", "60", "/c", SHUTDOWN_COMMENT]),
     abortShutdown: () => run("shutdown", ["/a"]),
   };
@@ -87,4 +96,30 @@ export async function listAgents(paseo: PaseoApi): Promise<AgentRow[]> {
       lastActivityAt: a.updatedAt ?? null,
     }))
     .sort((x, y) => (y.lastActivityAt ?? "").localeCompare(x.lastActivityAt ?? ""));
+}
+
+const PARENT_LABEL = "paseo.parent-agent-id";
+
+/** Agents created by this agent (recursively) that are still working or waiting on a permission. */
+async function busyDescendants(paseo: PaseoApi, rootId: string): Promise<string[]> {
+  const { entries } = await paseo.agents.list();
+  const children = new Map<string, typeof entries>();
+  for (const entry of entries) {
+    const parent = entry.agent.labels?.[PARENT_LABEL];
+    if (!parent) continue;
+    children.set(parent, [...(children.get(parent) ?? []), entry]);
+  }
+  const busy: string[] = [];
+  const queue = [rootId];
+  const seen = new Set(queue);
+  while (queue.length > 0) {
+    for (const { agent } of children.get(queue.shift()!) ?? []) {
+      if (seen.has(agent.id) || agent.archivedAt) continue;
+      seen.add(agent.id);
+      queue.push(agent.id);
+      const working = agent.status === "running" || agent.status === "initializing";
+      if (working || (agent.pendingPermissions?.length ?? 0) > 0) busy.push(agent.id);
+    }
+  }
+  return busy;
 }

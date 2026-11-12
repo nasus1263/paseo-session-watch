@@ -65,8 +65,12 @@ export default function contribute(server: PluginServerContext) {
           : ({ kind: "canceled", message: outcome.reason } as const);
     void engine.onTurnEnd(agent.id, agent.provider, end);
   });
-  // Any hook hands over the API; these fire often and cost nothing.
-  const removeTurnBefore = server.addHook("agent.turn.before", async (_e, { paseo }) => attach(paseo));
+  const removeTurnBefore = server.addHook("agent.turn.before", async ({ agent }, { paseo }) => {
+    attach(paseo);
+    await loaded;
+    void engine.onTurnStart(agent.id);
+  });
+  // Any hook hands over the API; this one fires often and costs nothing.
   const removePermission = server.addHook("agent.permission.before", async (_e, { paseo }) => attach(paseo));
 
   const timer = setInterval(() => void engine.tick(), TICK_MS);

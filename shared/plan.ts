@@ -1,7 +1,7 @@
 import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
 
-export const NodeState = z.enum(["pending", "running", "waiting_quota", "done", "failed", "skipped"]);
+export const NodeState = z.enum(["pending", "running", "settling", "waiting_quota", "done", "failed", "skipped"]);
 export type NodeState = z.infer<typeof NodeState>;
 
 const CreateSpec = z.object({
@@ -26,6 +26,10 @@ const NodeBase = z.object({
   note: z.string().nullable(),
   /** Skip when a dependency failed or was skipped; otherwise run once all dependencies settle. */
   skipOnFailure: z.boolean().default(true),
+  /** Quiet-period bookkeeping while a finished-looking turn is confirmed (state "settling"). */
+  settleSince: z.number().nullable().default(null),
+  lastUpdatedAt: z.string().nullable().default(null),
+  backgroundSince: z.number().nullable().default(null),
 });
 
 export const PlanNode = z.discriminatedUnion("kind", [
@@ -48,6 +52,8 @@ export const Plan = z.object({
   shutdown: z.boolean(),
   resumeMessage: z.string(),
   permissionTimeoutMin: z.number(),
+  quietMin: z.number().default(3),
+  backgroundMaxMin: z.number().default(240),
   shutdownAt: z.number().nullable(),
   nodes: z.array(PlanNode),
   log: z.array(LogEntry),
@@ -108,6 +114,8 @@ export const startRpc = defineRpc({
     shutdown: z.boolean(),
     resumeMessage: z.string().min(1),
     permissionTimeoutMin: z.number().min(1),
+    quietMin: z.number().min(0),
+    backgroundMaxMin: z.number().min(1),
   }),
   output: z.object({ plan: Plan }),
 });
@@ -145,6 +153,8 @@ export const EditorDraft = z.object({
   shutdown: z.boolean(),
   resumeMessage: z.string(),
   permissionMin: z.string(),
+  quietMin: z.string().default("3"),
+  backgroundMaxMin: z.string().default("240"),
   seq: z.number(),
 });
 export type EditorDraft = z.infer<typeof EditorDraft>;
@@ -155,6 +165,8 @@ export const EMPTY_DRAFT: EditorDraft = {
   shutdown: true,
   resumeMessage: "continue",
   permissionMin: "30",
+  quietMin: "3",
+  backgroundMaxMin: "240",
   seq: 1,
 };
 
@@ -189,7 +201,7 @@ export function buildNodes(drafts: readonly DraftNode[]): PlanNode[] {
     if (ids.has(d.id)) throw new Error(`중복된 노드 id: ${d.id}`);
     ids.add(d.id);
   }
-  const base = { agentId: null, state: "pending" as const, startedAt: null, resumedAt: null, quotaUntil: null, limitHits: 0, pendingPermissionSince: null, note: null };
+  const base = { settleSince: null, lastUpdatedAt: null, backgroundSince: null, agentId: null, state: "pending" as const, startedAt: null, resumedAt: null, quotaUntil: null, limitHits: 0, pendingPermissionSince: null, note: null };
   const nodes: PlanNode[] = [];
   // Agent key per node: a fixed agent id, or the creating node's id for agents made by the plan.
   const keyOf = new Map<string, string>();

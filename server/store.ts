@@ -27,7 +27,9 @@ export async function loadPlan(file: string): Promise<Plan | null> {
   } catch {
     return null;
   }
-  const parsed = Plan.safeParse(JSON.parse(raw));
+  const json = JSON.parse(raw);
+  if (json === null) return null; // A cleared plan.
+  const parsed = Plan.safeParse(json);
   if (!parsed.success) {
     console.error("저장된 계획을 읽지 못했습니다", parsed.error.message);
     return null;

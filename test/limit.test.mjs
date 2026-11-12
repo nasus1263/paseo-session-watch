@@ -48,3 +48,27 @@ test("resume time: usage reset + margin, unknown → 30 min, quick relimit → a
   assert.equal(resumeAt({ now, usageUntil: null, text: "try again in 10 minutes", resumedAt: null }), now + 12 * 60_000);
   assert.equal(resumeAt({ now, usageUntil: now + 60_000, text: "", resumedAt: now - 60_000 }), now + 15 * 60_000);
 });
+
+import { outstandingBackgroundTasks } from "../shared/claude-transcript.ts";
+
+const line = (o) => JSON.stringify(o);
+const notification = (taskId, summary, interim = false) =>
+  `<task-notification>\n<task-id>${taskId}</task-id>\n<tool-use-id>toolu_x</tool-use-id>\n<status>completed</status>\n<summary>${summary}</summary>\n${
+    interim ? "<note>This agent stopped with background work of its own still running. the result below may be interim.</note>\n" : ""
+  }</task-notification>`;
+
+test("transcript: launched background tasks stay outstanding until a final notification", () => {
+  const launches = [
+    line({ type: "user", toolUseResult: { status: "async_launched", agentId: "sub1" } }),
+    line({ type: "user", toolUseResult: { backgroundTaskId: "sh1", stdout: "" } }),
+    line({ type: "user", toolUseResult: { status: "completed", agentId: "fg" } }),
+  ];
+  assert.deepEqual(outstandingBackgroundTasks(launches.join("\n")), ["sub1", "sh1"]);
+
+  const interim = line({ type: "queue-operation", operation: "enqueue", content: notification("sub1", "waiting on its own background work", true) });
+  const shellDone = line({ type: "user", message: { role: "user", content: notification("sh1", "Background command completed") } });
+  assert.deepEqual(outstandingBackgroundTasks([...launches, interim, shellDone].join("\n")), ["sub1"]);
+
+  const final = line({ type: "user", message: { role: "user", content: [{ type: "text", text: notification("sub1", "Agent completed") }] } });
+  assert.deepEqual(outstandingBackgroundTasks([...launches, interim, shellDone, final, "{ partial"].join("\n")), []);
+});

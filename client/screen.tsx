@@ -83,7 +83,7 @@ function makeStyles(theme: PluginTheme, compact: boolean) {
           ? c.statusSuccess
           : state === "failed" || state === "skipped" || state === "error"
             ? c.statusDanger
-            : state === "waiting_quota"
+            : state === "waiting_quota" || state === "settling"
               ? c.statusWarning
               : c.surface2,
     }),
@@ -94,6 +94,7 @@ function makeStyles(theme: PluginTheme, compact: boolean) {
 const STATE_LABEL: Record<NodeState, string> = {
   pending: "대기",
   running: "실행 중",
+  settling: "종료 확인 중",
   waiting_quota: "한도 대기",
   done: "완료",
   failed: "실패",
@@ -171,7 +172,7 @@ function PlanView({ s, plan, now }: { s: Styles; plan: Plan; now: number }) {
       <View style={s.row}>
         <Text style={s.h2}>현재 계획: {PLAN_LABEL[plan.status]}</Text>
         <Text style={s.muted}>
-          PC 종료 {plan.shutdown ? "켬" : "끔"} · 재개 메시지 “{plan.resumeMessage}” · 권한 대기 {plan.permissionTimeoutMin}분
+          PC 종료 {plan.shutdown ? "켬" : "끔"} · 재개 메시지 “{plan.resumeMessage}” · 권한 대기 {plan.permissionTimeoutMin}분 · 조용한 시간 {plan.quietMin}분 · 백그라운드 최대 {plan.backgroundMaxMin}분
         </Text>
       </View>
       {plan.status === "shutting_down" && plan.shutdownAt ? (
@@ -278,10 +279,12 @@ function EditorForm({ s, initial }: { s: Styles; initial: EditorDraft }) {
   const [shutdown, setShutdown] = useState(initial.shutdown);
   const [resumeMessage, setResumeMessage] = useState(initial.resumeMessage);
   const [permissionMin, setPermissionMin] = useState(initial.permissionMin);
+  const [quietMin, setQuietMin] = useState(initial.quietMin);
+  const [backgroundMaxMin, setBackgroundMaxMin] = useState(initial.backgroundMaxMin);
   const [seq, setSeq] = useState(initial.seq);
   const current = useMemo(
-    () => ({ selected, followUps, shutdown, resumeMessage, permissionMin, seq }),
-    [selected, followUps, shutdown, resumeMessage, permissionMin, seq],
+    () => ({ selected, followUps, shutdown, resumeMessage, permissionMin, quietMin, backgroundMaxMin, seq }),
+    [selected, followUps, shutdown, resumeMessage, permissionMin, quietMin, backgroundMaxMin, seq],
   );
   useDraftPersistence(current);
 
@@ -373,12 +376,19 @@ function EditorForm({ s, initial }: { s: Styles; initial: EditorDraft }) {
   });
   const minutes = Number(permissionMin);
   if (!(minutes >= 1)) problems.push("권한 대기 제한은 1분 이상이어야 합니다");
+  const quiet = Number(quietMin);
+  if (!(quiet >= 0) || quietMin.trim() === "") problems.push("조용한 시간은 0분 이상이어야 합니다");
+  const backgroundMax = Number(backgroundMaxMin);
+  if (!(backgroundMax >= 1)) problems.push("백그라운드 작업 최대 대기는 1분 이상이어야 합니다");
   if (!resumeMessage.trim()) problems.push("재개 메시지를 입력하세요");
   const empty = selected.length === 0 && followUps.length === 0;
 
   const startM = useMutation({
     mutationFn: () =>
-      start({ nodes: draft(), shutdown, resumeMessage: resumeMessage.trim(), permissionTimeoutMin: minutes }),
+      start({ nodes: draft(), shutdown, resumeMessage: resumeMessage.trim(), permissionTimeoutMin: minutes,
+        quietMin: quiet,
+        backgroundMaxMin: backgroundMax,
+      }),
     onSuccess: () => {
       setSelected([]);
       setFollowUps([]);
@@ -522,6 +532,12 @@ function EditorForm({ s, initial }: { s: Styles; initial: EditorDraft }) {
         <TextInput style={s.input} value={resumeMessage} onChangeText={setResumeMessage} />
         <Text style={s.muted}>권한 요청 대기 제한(분). 넘으면 그 작업은 실패로 처리</Text>
         <TextInput style={s.input} value={permissionMin} onChangeText={setPermissionMin} keyboardType="number-pad" />
+        <Text style={s.muted}>
+          조용한 시간(분). 턴이 끝난 뒤 이 시간 동안 새 턴, 활동, 백그라운드 작업, 실행 중인 하위 에이전트가 없어야 완료로 봅니다
+        </Text>
+        <TextInput style={s.input} value={quietMin} onChangeText={setQuietMin} keyboardType="number-pad" />
+        <Text style={s.muted}>백그라운드 작업 최대 대기(분). 넘으면 남은 백그라운드 작업을 무시합니다</Text>
+        <TextInput style={s.input} value={backgroundMaxMin} onChangeText={setBackgroundMaxMin} keyboardType="number-pad" />
       </View>
 
       {problems.map((p) => (

@@ -8,10 +8,17 @@ function harness(agents) {
   const texts = new Map();
   let usage = null;
   let saved = null;
+  const background = new Map();
+  const children = new Map();
   const gateway = {
     async agent(id) {
       const a = agents[id];
-      return a ? { provider: "claude", lastError: null, pendingPermissions: 0, archived: false, ...a } : null;
+      return a
+        ? { provider: "claude", lastError: null, pendingPermissions: 0, archived: false, updatedAt: null, sessionId: null, ...a }
+        : null;
+    },
+    async activity(id) {
+      return { background: background.get(id) ?? [], busyChildren: children.get(id) ?? [] };
     },
     async lastAssistantText(id) {
       return texts.get(id) ?? null;
@@ -42,18 +49,22 @@ function harness(agents) {
     engine,
     calls,
     texts,
+    background,
+    children,
     setUsage: (v) => (usage = v),
     advance: (ms) => (now += ms),
     now: () => now,
     saved: () => saved,
-    finishTurn(id, end = { kind: "completed" }) {
+    /** Ends a turn; by default also runs one tick so a quiet period of 0 settles it to done. */
+    async finishTurn(id, end = { kind: "completed" }, { settle = true } = {}) {
       agents[id].status = end.kind === "failed" ? "error" : "idle";
-      return engine.onTurnEnd(id, "claude", end);
+      await engine.onTurnEnd(id, "claude", end);
+      if (settle) await engine.tick();
     },
   };
 }
 
-const opts = { shutdown: true, resumeMessage: "continue", permissionTimeoutMin: 30 };
+const opts = { shutdown: true, resumeMessage: "continue", permissionTimeoutMin: 30, quietMin: 0, backgroundMaxMin: 240 };
 const watch = (id, agentId) => ({ kind: "watch", id, agentId, label: agentId });
 const state = (plan) => Object.fromEntries(plan.nodes.map((n) => [n.id, n.state]));
 
@@ -169,6 +180,8 @@ test("a missed hook is reconciled from the snapshot after the start grace", asyn
   assert.equal(h.saved().nodes[0].state, "running");
   h.advance(60_000);
   await h.engine.tick();
+  assert.equal(h.saved().nodes[0].state, "settling");
+  await h.engine.tick();
   assert.equal(h.saved().nodes[0].state, "done");
 });
 
@@ -186,6 +199,7 @@ test("a permission wait beyond the limit fails the node", async () => {
 test("cancel during the countdown aborts the shutdown", async () => {
   const h = harness({ a: { status: "idle" } });
   await h.engine.start({ ...opts, nodes: [watch("w1", "a")] });
+  await h.engine.tick();
   assert.equal(h.saved().status, "shutting_down");
   await h.engine.cancel();
   assert.equal(h.saved().status, "canceled");
@@ -195,6 +209,7 @@ test("cancel during the countdown aborts the shutdown", async () => {
 test("without shutdown the plan just finishes", async () => {
   const h = harness({ a: { status: "idle" } });
   await h.engine.start({ ...opts, shutdown: false, nodes: [watch("w1", "a")] });
+  await h.engine.tick();
   assert.equal(h.saved().status, "finished");
   assert.deepEqual(h.calls, []);
 });
@@ -243,4 +258,131 @@ test("a usage limit on a dependency is a wait, not a failure: dependents are not
   await h.finishTurn("a");
   assert.deepEqual(h.calls, [["send", "a", "continue"], ["send", "a", "검토해"]]);
   assert.deepEqual(state(h.saved()), { w1: "done", f1: "running" });
+});
+
+const quiet = { ...opts, quietMin: 3 };
+
+test("a finished turn is done only after the quiet period", async () => {
+  const h = harness({ a: { status: "running" } });
+  await h.engine.start({ ...quiet, nodes: [watch("w1", "a")] });
+  await h.finishTurn("a");
+  assert.equal(h.saved().nodes[0].state, "settling");
+  h.advance(2 * 60_000);
+  await h.engine.tick();
+  assert.equal(h.saved().nodes[0].state, "settling");
+  h.advance(60_000);
+  await h.engine.tick();
+  assert.equal(h.saved().nodes[0].state, "done");
+  assert.equal(h.saved().status, "shutting_down");
+});
+
+test("an autonomous wake-up while settling reopens the node", async () => {
+  const agents = { a: { status: "running" } };
+  const h = harness(agents);
+  await h.engine.start({ ...quiet, nodes: [watch("w1", "a")] });
+  await h.finishTurn("a");
+  h.advance(60_000);
+  agents.a.status = "running";
+  await h.engine.onTurnStart("a");
+  assert.equal(h.saved().nodes[0].state, "running");
+  h.advance(60_000);
+  await h.finishTurn("a");
+  h.advance(2 * 60_000);
+  await h.engine.tick();
+  assert.equal(h.saved().nodes[0].state, "settling", "quiet period restarts from the second turn end");
+  h.advance(60_000);
+  await h.engine.tick();
+  assert.equal(h.saved().nodes[0].state, "done");
+});
+
+test("a status flip to running seen by the tick also reopens a settling node", async () => {
+  const agents = { a: { status: "running" } };
+  const h = harness(agents);
+  await h.engine.start({ ...quiet, nodes: [watch("w1", "a")] });
+  await h.finishTurn("a");
+  agents.a.status = "running"; // turn.before hook missed
+  h.advance(30_000);
+  await h.engine.tick();
+  assert.equal(h.saved().nodes[0].state, "running");
+});
+
+test("background work keeps the node settling until it finishes", async () => {
+  const h = harness({ a: { status: "running" } });
+  await h.engine.start({ ...quiet, nodes: [watch("w1", "a")] });
+  h.background.set("a", ["a378a246d2f147950"]);
+  await h.finishTurn("a");
+  for (let i = 0; i < 20; i++) {
+    h.advance(60_000);
+    await h.engine.tick();
+  }
+  const node = h.saved().nodes[0];
+  assert.equal(node.state, "settling");
+  assert.match(node.note, /백그라운드 작업 1개/);
+  h.background.set("a", []);
+  h.advance(60_000);
+  await h.engine.tick();
+  assert.equal(h.saved().nodes[0].state, "settling");
+  h.advance(3 * 60_000);
+  await h.engine.tick();
+  assert.equal(h.saved().nodes[0].state, "done");
+});
+
+test("background work older than the cap is ignored", async () => {
+  const h = harness({ a: { status: "running" } });
+  await h.engine.start({ ...quiet, backgroundMaxMin: 10, nodes: [watch("w1", "a")] });
+  h.background.set("a", ["stuck"]);
+  await h.finishTurn("a");
+  h.advance(9 * 60_000);
+  await h.engine.tick();
+  assert.equal(h.saved().nodes[0].state, "settling");
+  // Past the cap (10 min) the leftover task is ignored and the quiet period counts from the cap.
+  h.advance(2 * 60_000);
+  await h.engine.tick();
+  assert.equal(h.saved().nodes[0].state, "settling");
+  h.advance(2 * 60_000);
+  await h.engine.tick();
+  assert.equal(h.saved().nodes[0].state, "done");
+});
+
+test("a busy child agent keeps its parent settling", async () => {
+  const h = harness({ a: { status: "running" } });
+  await h.engine.start({ ...quiet, nodes: [watch("w1", "a")] });
+  h.children.set("a", ["child-1"]);
+  await h.finishTurn("a");
+  h.advance(10 * 60_000);
+  await h.engine.tick();
+  assert.match(h.saved().nodes[0].note, /하위 에이전트 1개/);
+  h.children.set("a", []);
+  h.advance(3 * 60_000);
+  await h.engine.tick();
+  assert.equal(h.saved().nodes[0].state, "done");
+});
+
+test("snapshot activity while idle restarts the quiet period", async () => {
+  const agents = { a: { status: "running", updatedAt: "t0" } };
+  const h = harness(agents);
+  await h.engine.start({ ...quiet, nodes: [watch("w1", "a")] });
+  await h.finishTurn("a");
+  h.advance(2 * 60_000);
+  agents.a.updatedAt = "t1";
+  await h.engine.tick();
+  h.advance(2 * 60_000);
+  await h.engine.tick();
+  assert.equal(h.saved().nodes[0].state, "settling");
+  h.advance(60_000);
+  await h.engine.tick();
+  assert.equal(h.saved().nodes[0].state, "done");
+});
+
+test("follow-ups wait for the dependency to settle, not just for its turn to end", async () => {
+  const h = harness({ a: { status: "running" } });
+  await h.engine.start({
+    ...quiet,
+    nodes: [watch("w1", "a"), { kind: "send", id: "f1", after: ["w1"], target: { nodeId: "w1" }, text: "검토해", label: "f1" }],
+  });
+  await h.finishTurn("a");
+  assert.deepEqual(h.calls, []);
+  h.advance(3 * 60_000);
+  await h.engine.tick();
+  assert.deepEqual(h.calls, [["send", "a", "검토해"]]);
 });

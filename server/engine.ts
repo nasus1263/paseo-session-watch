@@ -15,6 +15,18 @@ export interface AgentInfo {
   lastError: string | null;
   pendingPermissions: number;
   archived: boolean;
+  /** Changes whenever the daemon records activity, even while the status stays idle. */
+  updatedAt: string | null;
+  /** Provider session id (Claude transcript name), when known. */
+  sessionId: string | null;
+}
+
+/** Work that can outlive a turn: provider background tasks and Paseo child agents. */
+export interface Activity {
+  /** Background task ids still running, or null when they cannot be read. */
+  background: string[] | null;
+  /** Descendant Paseo agents that are running or waiting on a permission. */
+  busyChildren: string[];
 }
 
 /** Everything the engine needs from Paseo and the OS. */
@@ -25,6 +37,7 @@ export interface Gateway {
   create(spec: { cwd: string; provider: string; modeId?: string; title?: string; prompt: string }): Promise<string>;
   /** Latest reset among this provider's exhausted usage windows, or null when unknown. */
   usageUntil(provider: string): Promise<number | null>;
+  activity(id: string, info: AgentInfo): Promise<Activity>;
   shutdown(): Promise<void>;
   abortShutdown(): Promise<void>;
 }
@@ -34,6 +47,8 @@ export interface StartInput {
   shutdown: boolean;
   resumeMessage: string;
   permissionTimeoutMin: number;
+  quietMin: number;
+  backgroundMaxMin: number;
 }
 
 export const SHUTDOWN_DELAY_MS = 60_000;
@@ -94,6 +109,8 @@ export class Engine {
         shutdown: input.shutdown,
         resumeMessage: input.resumeMessage,
         permissionTimeoutMin: input.permissionTimeoutMin,
+        quietMin: input.quietMin,
+        backgroundMaxMin: input.backgroundMaxMin,
         shutdownAt: null,
         nodes: buildNodes(input.nodes),
         log: [],
@@ -142,6 +159,16 @@ export class Engine {
     });
   }
 
+  /** A new turn on a settling agent (autonomous wake-up, queued message) means it was not done. */
+  onTurnStart(agentId: string): Promise<void> {
+    return this.run(async () => {
+      const node = this.runningNodeFor(agentId);
+      if (!node || node.state !== "settling") return;
+      this.reopen(node, "새 턴 시작");
+      await this.save();
+    });
+  }
+
   /** Periodic reconciliation: catches missed hooks, permission waits, and quota timers. */
   tick(): Promise<void> {
     return this.run(async () => {
@@ -162,6 +189,7 @@ export class Engine {
 
       for (const node of plan.nodes) {
         if (node.state === "running") await this.checkRunning(node, now);
+        else if (node.state === "settling") await this.checkSettling(node, now);
         else if (node.state === "waiting_quota" && node.quotaUntil !== null && now >= node.quotaUntil) {
           await this.tryResume(node, now);
         }
@@ -195,6 +223,81 @@ export class Engine {
     await this.finishNode(node, info.provider, endFromSnapshot(info));
   }
 
+  /**
+   * Done only after the agent has stayed quiet for the whole quiet period: idle, no new turn,
+   * no snapshot change, no running background task, and no busy descendant agent.
+   */
+  private async checkSettling(node: PlanNode, now: number) {
+    const gw = this.gateway!;
+    const plan = this.plan!;
+    const agentId = nodeAgentId(plan, node)!;
+    const info = await gw.agent(agentId);
+    if (!info || info.archived) {
+      this.fail(node, info ? "에이전트가 보관되었습니다" : "에이전트를 찾을 수 없습니다");
+      return;
+    }
+    if (isBusy(info.status) || info.pendingPermissions > 0) {
+      this.reopen(node, isBusy(info.status) ? "다시 실행 중" : "권한 요청 대기");
+      return;
+    }
+    if (info.status === "error") {
+      await this.finishNode(node, info.provider, endFromSnapshot(info));
+      return;
+    }
+    let quietSince = node.settleSince ?? now;
+    const reasons: string[] = [];
+    if (node.lastUpdatedAt !== null && info.updatedAt !== node.lastUpdatedAt) {
+      quietSince = now;
+      reasons.push("활동 감지");
+    }
+    node.lastUpdatedAt = info.updatedAt;
+
+    const activity = await gw.activity(agentId, info).catch(() => ({ background: null, busyChildren: [] }));
+    if (activity.busyChildren.length > 0) {
+      quietSince = now;
+      reasons.push(`하위 에이전트 ${activity.busyChildren.length}개 실행 중`);
+    }
+    const background = activity.background ?? [];
+    if (background.length > 0) {
+      node.backgroundSince ??= now;
+      if (now - node.backgroundSince <= plan.backgroundMaxMin * 60_000) {
+        quietSince = now;
+        reasons.push(`백그라운드 작업 ${background.length}개 실행 중`);
+      } else {
+        // From the cap on the leftover tasks are ignored; the quiet period counts from the cap.
+        quietSince = Math.max(quietSince, node.backgroundSince + plan.backgroundMaxMin * 60_000);
+        reasons.push(`백그라운드 작업 대기 ${plan.backgroundMaxMin}분 초과, 무시`);
+      }
+    } else {
+      node.backgroundSince = null;
+    }
+    node.settleSince = quietSince;
+
+    const quietMs = plan.quietMin * 60_000;
+    if (now - quietSince >= quietMs) {
+      node.state = "done";
+      node.note = null;
+      node.settleSince = null;
+      node.backgroundSince = null;
+      this.log(`${node.label}: 완료 (${plan.quietMin}분간 활동 없음)`);
+      return;
+    }
+    const left = Math.ceil((quietMs - (now - quietSince)) / 60_000);
+    const note = reasons.length > 0 ? `종료 확인 중: ${reasons.join(", ")}` : `종료 확인 중: ${left}분 더 조용하면 완료`;
+    if (reasons.length > 0 && note !== node.note) this.log(`${node.label}: ${note}`);
+    node.note = note;
+  }
+
+  /** Back to running from settling; the next turn end is judged from scratch. */
+  private reopen(node: PlanNode, reason: string) {
+    node.state = "running";
+    node.startedAt = this.now();
+    node.settleSince = null;
+    node.lastUpdatedAt = null;
+    node.note = null;
+    this.log(`${node.label}: ${reason}, 감시 계속`);
+  }
+
   private async finishNode(node: PlanNode, provider: string, end: TurnEnd) {
     const gw = this.gateway!;
     const agentId = nodeAgentId(this.plan!, node)!;
@@ -202,9 +305,13 @@ export class Engine {
     const verdict = classifyTurnEnd(end, text);
     node.pendingPermissionSince = null;
     if (verdict === "done") {
-      node.state = "done";
-      node.note = null;
-      this.log(`${node.label}: 완료`);
+      // A finished turn is only a candidate: background work or a wake-up may follow.
+      node.state = "settling";
+      node.settleSince = this.now();
+      node.lastUpdatedAt = null;
+      node.backgroundSince = null;
+      node.note = "종료 확인 중";
+      this.log(`${node.label}: 턴 종료, 종료 확인 시작`);
       return;
     }
     if (verdict === "failed") {
@@ -347,7 +454,9 @@ export class Engine {
   private runningNodeFor(agentId: string): PlanNode | undefined {
     const plan = this.plan;
     if (!plan || plan.status !== "active") return undefined;
-    return plan.nodes.find((n) => n.state === "running" && nodeAgentId(plan, n) === agentId);
+    return plan.nodes.find(
+      (n) => (n.state === "running" || n.state === "settling") && nodeAgentId(plan, n) === agentId,
+    );
   }
 
   private fail(node: PlanNode, reason: string) {
