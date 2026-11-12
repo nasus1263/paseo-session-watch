@@ -246,6 +246,8 @@ function Editor({ s }: { s: Styles }) {
 
   const rows = agents.data?.agents ?? [];
   const byId = new Map(rows.map((a) => [a.id, a]));
+  // Only running sessions are offered; a selected one stays visible after it stops so it can be unchecked.
+  const visible = rows.filter((a) => a.status === "running" || selected.includes(a.id));
   const watchId = (agentId: string) => `w${selected.indexOf(agentId) + 1}`;
   const nodeLabel = (id: string) => {
     if (id.startsWith("w")) {
@@ -343,9 +345,14 @@ function Editor({ s }: { s: Styles }) {
   return (
     <View style={{ gap: 16 }}>
       <View style={s.card}>
-        <Text style={s.h2}>1. 감시할 세션</Text>
+        <View style={s.row}>
+          <Text style={s.h2}>1. 감시할 세션 (실행 중)</Text>
+          <Button s={s} label="새로고침" disabled={agents.isFetching} onPress={() => void agents.refetch()} />
+        </View>
         {agents.isLoading ? <Text style={s.muted}>불러오는 중…</Text> : null}
-        {rows.map((a: AgentRow) => {
+        {agents.error ? <Text style={s.danger}>{String(agents.error)}</Text> : null}
+        {agents.data && visible.length === 0 ? <Text style={s.muted}>실행 중인 세션이 없습니다</Text> : null}
+        {visible.map((a: AgentRow) => {
           const on = selected.includes(a.id);
           return (
             <Pressable
