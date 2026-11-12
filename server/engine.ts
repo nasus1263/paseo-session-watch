@@ -1,0 +1,381 @@
+import { classifyTurnEnd, MAX_LIMIT_HITS, resumeAt, type TurnEnd } from "../shared/limit";
+import {
+  buildNodes,
+  isTerminal,
+  nodeAgentId,
+  settlePending,
+  type DraftNode,
+  type Plan,
+  type PlanNode,
+} from "../shared/plan";
+
+export interface AgentInfo {
+  status: string; // initializing | idle | running | error | closed
+  provider: string;
+  lastError: string | null;
+  pendingPermissions: number;
+  archived: boolean;
+}
+
+/** Everything the engine needs from Paseo and the OS. */
+export interface Gateway {
+  agent(id: string): Promise<AgentInfo | null>;
+  lastAssistantText(id: string): Promise<string | null>;
+  send(id: string, text: string): Promise<void>;
+  create(spec: { cwd: string; provider: string; modeId?: string; title?: string; prompt: string }): Promise<string>;
+  /** Latest reset among this provider's exhausted usage windows, or null when unknown. */
+  usageUntil(provider: string): Promise<number | null>;
+  shutdown(): Promise<void>;
+  abortShutdown(): Promise<void>;
+}
+
+export interface StartInput {
+  nodes: DraftNode[];
+  shutdown: boolean;
+  resumeMessage: string;
+  permissionTimeoutMin: number;
+}
+
+export const SHUTDOWN_DELAY_MS = 60_000;
+/** A turn we just started may still read idle for a moment; trust snapshots only after this. */
+const START_GRACE_MS = 60_000;
+const MAX_LOG = 300;
+
+const isBusy = (status: string) => status === "running" || status === "initializing";
+
+export class Engine {
+  private plan: Plan | null = null;
+  private gateway: Gateway | null = null;
+  private chain: Promise<unknown> = Promise.resolve();
+  private readonly persist: (plan: Plan | null) => Promise<void>;
+  private readonly now: () => number;
+
+  constructor(persist: (plan: Plan | null) => Promise<void>, now: () => number = Date.now) {
+    this.persist = persist;
+    this.now = now;
+  }
+
+  load(plan: Plan | null) {
+    this.plan = plan;
+  }
+
+  /** Paseo hands the API only to handlers; the first one to run unlocks the engine. */
+  attach(gateway: Gateway) {
+    if (this.gateway) return;
+    this.gateway = gateway;
+    void this.tick();
+  }
+
+  get attached() {
+    return this.gateway !== null;
+  }
+
+  snapshot(): Plan | null {
+    return this.plan;
+  }
+
+  /** Every state change goes through this queue, so hooks and timers never interleave. */
+  private run<T>(fn: () => Promise<T>): Promise<T> {
+    const next = this.chain.then(fn);
+    this.chain = next.catch((error) => console.error("세션 감시 작업 실패", error));
+    return next;
+  }
+
+  start(input: StartInput): Promise<Plan> {
+    return this.run(async () => {
+      if (this.plan && (this.plan.status === "active" || this.plan.status === "shutting_down")) {
+        throw new Error("이미 진행 중인 계획이 있습니다. 먼저 취소하세요.");
+      }
+      const now = this.now();
+      this.plan = {
+        id: `plan-${now}`,
+        createdAt: now,
+        status: "active",
+        shutdown: input.shutdown,
+        resumeMessage: input.resumeMessage,
+        permissionTimeoutMin: input.permissionTimeoutMin,
+        shutdownAt: null,
+        nodes: buildNodes(input.nodes),
+        log: [],
+      };
+      this.log(`계획 시작: 노드 ${this.plan.nodes.length}개, PC 종료 ${input.shutdown ? "켬" : "끔"}`);
+      await this.advance();
+      await this.save();
+      return this.plan;
+    });
+  }
+
+  cancel(): Promise<Plan | null> {
+    return this.run(async () => {
+      const plan = this.plan;
+      if (!plan) return null;
+      if (plan.status === "shutting_down") {
+        await this.gateway?.abortShutdown();
+        this.log("PC 종료를 취소했습니다");
+      }
+      if (plan.status === "active" || plan.status === "shutting_down") {
+        plan.status = "canceled";
+        this.log("계획을 취소했습니다. 에이전트는 그대로 둡니다");
+        await this.save();
+      }
+      return plan;
+    });
+  }
+
+  clear(): Promise<void> {
+    return this.run(async () => {
+      if (this.plan && (this.plan.status === "active" || this.plan.status === "shutting_down")) {
+        throw new Error("진행 중인 계획은 지울 수 없습니다. 먼저 취소하세요.");
+      }
+      this.plan = null;
+      await this.save();
+    });
+  }
+
+  onTurnEnd(agentId: string, provider: string, end: TurnEnd): Promise<void> {
+    return this.run(async () => {
+      const node = this.runningNodeFor(agentId);
+      if (!node) return;
+      await this.finishNode(node, provider, end);
+      await this.advance();
+      await this.save();
+    });
+  }
+
+  /** Periodic reconciliation: catches missed hooks, permission waits, and quota timers. */
+  tick(): Promise<void> {
+    return this.run(async () => {
+      const plan = this.plan;
+      const gw = this.gateway;
+      if (!plan || !gw) return;
+      const now = this.now();
+      if (plan.status === "shutting_down") {
+        // Still alive well after the scheduled shutdown: it was aborted outside the plugin.
+        if (plan.shutdownAt !== null && now > plan.shutdownAt + 5 * 60_000) {
+          plan.status = "finished";
+          this.log("예정된 PC 종료가 일어나지 않았습니다(외부에서 취소된 것으로 봄)");
+          await this.save();
+        }
+        return;
+      }
+      if (plan.status !== "active") return;
+
+      for (const node of plan.nodes) {
+        if (node.state === "running") await this.checkRunning(node, now);
+        else if (node.state === "waiting_quota" && node.quotaUntil !== null && now >= node.quotaUntil) {
+          await this.tryResume(node, now);
+        }
+      }
+      await this.advance();
+      await this.save();
+    });
+  }
+
+  private async checkRunning(node: PlanNode, now: number) {
+    const gw = this.gateway!;
+    const plan = this.plan!;
+    const agentId = nodeAgentId(plan, node);
+    if (!agentId) return;
+    const info = await gw.agent(agentId);
+    if (!info || info.archived) {
+      this.fail(node, info ? "에이전트가 보관되었습니다" : "에이전트를 찾을 수 없습니다");
+      return;
+    }
+    if (info.pendingPermissions > 0) {
+      node.pendingPermissionSince ??= now;
+      if (now - node.pendingPermissionSince > plan.permissionTimeoutMin * 60_000) {
+        this.fail(node, `권한 요청이 ${plan.permissionTimeoutMin}분 넘게 대기 중`);
+      }
+      return;
+    }
+    node.pendingPermissionSince = null;
+    if (isBusy(info.status)) return;
+    if (node.startedAt !== null && now - node.startedAt < START_GRACE_MS) return;
+    this.log(`${node.label}: 종료 훅을 놓쳐 스냅샷으로 판정합니다 (상태 ${info.status})`);
+    await this.finishNode(node, info.provider, endFromSnapshot(info));
+  }
+
+  private async finishNode(node: PlanNode, provider: string, end: TurnEnd) {
+    const gw = this.gateway!;
+    const agentId = nodeAgentId(this.plan!, node)!;
+    const text = await gw.lastAssistantText(agentId).catch(() => null);
+    const verdict = classifyTurnEnd(end, text);
+    node.pendingPermissionSince = null;
+    if (verdict === "done") {
+      node.state = "done";
+      node.note = null;
+      this.log(`${node.label}: 완료`);
+      return;
+    }
+    if (verdict === "failed") {
+      this.fail(node, end.kind === "completed" ? "실패" : end.message);
+      return;
+    }
+    node.limitHits += 1;
+    if (node.limitHits > MAX_LIMIT_HITS) {
+      this.fail(node, `한도 재시도 ${MAX_LIMIT_HITS}회 초과`);
+      return;
+    }
+    const now = this.now();
+    const usageUntil = await gw.usageUntil(provider).catch(() => null);
+    const message = [end.kind === "completed" ? "" : end.message, text ?? ""].join("\n");
+    node.quotaUntil = resumeAt({ now, usageUntil, text: message, resumedAt: node.resumedAt });
+    node.state = "waiting_quota";
+    node.note = (text ?? message).trim().slice(0, 200) || null;
+    this.log(`${node.label}: 한도 도달(${node.limitHits}회). ${new Date(node.quotaUntil).toISOString()}에 재개 시도`);
+  }
+
+  private async tryResume(node: PlanNode, now: number) {
+    const gw = this.gateway!;
+    const plan = this.plan!;
+    const agentId = nodeAgentId(plan, node)!;
+    const info = await gw.agent(agentId);
+    if (!info || info.archived) {
+      this.fail(node, "재개할 에이전트가 없습니다");
+      return;
+    }
+    const until = await gw.usageUntil(info.provider).catch(() => null);
+    if (until !== null && until > now) {
+      node.quotaUntil = resumeAt({ now, usageUntil: until, text: "", resumedAt: null });
+      this.log(`${node.label}: 아직 한도 소진 상태. ${new Date(node.quotaUntil).toISOString()}까지 다시 대기`);
+      return;
+    }
+    if (isBusy(info.status)) {
+      // Someone resumed it by hand; follow that turn instead of sending another prompt.
+      node.state = "running";
+      node.startedAt = now;
+      this.log(`${node.label}: 이미 다시 실행 중이라 재개 메시지를 생략합니다`);
+      return;
+    }
+    await gw.send(agentId, plan.resumeMessage);
+    node.state = "running";
+    node.startedAt = now;
+    node.resumedAt = now;
+    node.quotaUntil = null;
+    this.log(`${node.label}: "${plan.resumeMessage}" 전송으로 재개`);
+  }
+
+  /** Starts or skips pending nodes until nothing changes, then checks for completion. */
+  private async advance() {
+    const plan = this.plan;
+    const gw = this.gateway;
+    if (!plan || plan.status !== "active" || !gw) return;
+    for (let changed = true; changed; ) {
+      changed = false;
+      const { start, skip } = settlePending(plan);
+      for (const node of skip) {
+        node.state = "skipped";
+        node.note = "선행 작업이 실패해 건너뜀";
+        this.log(`${node.label}: 건너뜀`);
+        changed = true;
+      }
+      for (const node of start) {
+        const before = node.state;
+        try {
+          await this.startNode(node);
+        } catch (error) {
+          this.fail(node, `시작 실패: ${describe(error)}`);
+        }
+        if (node.state !== before) changed = true;
+      }
+    }
+    if (plan.nodes.every((n) => isTerminal(n.state))) await this.complete();
+  }
+
+  private async startNode(node: PlanNode) {
+    const gw = this.gateway!;
+    const plan = this.plan!;
+    const now = this.now();
+    if (node.kind === "create") {
+      const { cwd, provider, modeId, title, prompt } = node.create;
+      node.agentId = await gw.create({ cwd, provider, modeId, title, prompt });
+      node.state = "running";
+      node.startedAt = now;
+      this.log(`${node.label}: 새 세션 ${node.agentId} 생성`);
+      return;
+    }
+    const agentId = nodeAgentId(plan, node);
+    if (!agentId) {
+      this.fail(node, "대상 에이전트를 정할 수 없습니다");
+      return;
+    }
+    const info = await gw.agent(agentId);
+    if (!info || info.archived) {
+      this.fail(node, info ? "에이전트가 보관되었습니다" : "에이전트를 찾을 수 없습니다");
+      return;
+    }
+    if (node.kind === "watch") {
+      if (isBusy(info.status)) {
+        node.state = "running";
+        node.startedAt = now;
+        this.log(`${node.label}: 감시 시작`);
+      } else {
+        // Already stopped: judge its last turn now, which also catches a session cut off by a limit.
+        node.startedAt = null;
+        node.state = "running";
+        await this.finishNode(node, info.provider, endFromSnapshot(info));
+      }
+      return;
+    }
+    if (isBusy(info.status)) return; // Wait for the agent's own turn to end first.
+    node.agentId = agentId;
+    await gw.send(agentId, node.text);
+    node.state = "running";
+    node.startedAt = now;
+    this.log(`${node.label}: 메시지 전송`);
+  }
+
+  private async complete() {
+    const plan = this.plan!;
+    const failed = plan.nodes.filter((n) => n.state !== "done").length;
+    this.log(`모든 작업 종결 (완료 ${plan.nodes.length - failed}, 실패/건너뜀 ${failed})`);
+    if (!plan.shutdown) {
+      plan.status = "finished";
+      return;
+    }
+    try {
+      await this.gateway!.shutdown();
+      plan.status = "shutting_down";
+      plan.shutdownAt = this.now() + SHUTDOWN_DELAY_MS;
+      this.log("60초 후 PC를 종료합니다");
+    } catch (error) {
+      plan.status = "finished";
+      this.log(`PC 종료 명령 실패: ${describe(error)}`);
+    }
+  }
+
+  private runningNodeFor(agentId: string): PlanNode | undefined {
+    const plan = this.plan;
+    if (!plan || plan.status !== "active") return undefined;
+    return plan.nodes.find((n) => n.state === "running" && nodeAgentId(plan, n) === agentId);
+  }
+
+  private fail(node: PlanNode, reason: string) {
+    node.state = "failed";
+    node.note = reason;
+    node.pendingPermissionSince = null;
+    this.log(`${node.label}: 실패 - ${reason}`);
+  }
+
+  private log(text: string) {
+    const plan = this.plan;
+    console.log(`[session-watch] ${text}`);
+    if (!plan) return;
+    plan.log.push({ at: this.now(), text });
+    if (plan.log.length > MAX_LOG) plan.log.splice(0, plan.log.length - MAX_LOG);
+  }
+
+  private async save() {
+    await this.persist(this.plan);
+  }
+}
+
+export function endFromSnapshot(info: AgentInfo): TurnEnd {
+  if (info.status === "error") return { kind: "failed", message: info.lastError ?? "에이전트 오류" };
+  if (info.status === "closed") return { kind: "canceled", message: "에이전트가 닫혔습니다" };
+  return { kind: "completed" };
+}
+
+function describe(error: unknown) {
+  return error instanceof Error ? error.message : String(error);
+}
