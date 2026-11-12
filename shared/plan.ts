@@ -24,6 +24,8 @@ const NodeBase = z.object({
   limitHits: z.number(),
   pendingPermissionSince: z.number().nullable(),
   note: z.string().nullable(),
+  /** Skip when a dependency failed or was skipped; otherwise run once all dependencies settle. */
+  skipOnFailure: z.boolean().default(true),
 });
 
 export const PlanNode = z.discriminatedUnion("kind", [
@@ -62,8 +64,16 @@ export const DraftNode = z.discriminatedUnion("kind", [
     target: z.union([z.object({ agentId: z.string() }), z.object({ nodeId: z.string() })]),
     text: z.string().min(1),
     label: z.string(),
+    skipOnFailure: z.boolean().default(true),
   }),
-  z.object({ kind: z.literal("create"), id: z.string(), after: z.array(z.string()), create: CreateSpec, label: z.string() }),
+  z.object({
+    kind: z.literal("create"),
+    id: z.string(),
+    after: z.array(z.string()),
+    create: CreateSpec,
+    label: z.string(),
+    skipOnFailure: z.boolean().default(true),
+  }),
 ]);
 export type DraftNode = z.infer<typeof DraftNode>;
 
@@ -125,6 +135,7 @@ export const FollowUpDraft = z.object({
   provider: z.string(),
   modeId: z.string(),
   title: z.string(),
+  skipOnFailure: z.boolean().default(true),
 });
 export type FollowUpDraft = z.infer<typeof FollowUpDraft>;
 
@@ -197,9 +208,13 @@ export function buildNodes(drafts: readonly DraftNode[]): PlanNode[] {
     // Earlier nodes on the same agent run first.
     for (const [nid, k] of keyOf) if (k === key && !after.includes(nid)) after.push(nid);
     keyOf.set(d.id, key);
-    if (d.kind === "watch") nodes.push({ ...base, kind: "watch", id: d.id, label: d.label, after, agentId: d.agentId });
-    else if (d.kind === "send") nodes.push({ ...base, kind: "send", id: d.id, label: d.label, after, target: d.target, text: d.text });
-    else nodes.push({ ...base, kind: "create", id: d.id, label: d.label, after, create: d.create });
+    if (d.kind === "watch") {
+      nodes.push({ ...base, skipOnFailure: true, kind: "watch", id: d.id, label: d.label, after, agentId: d.agentId });
+      continue;
+    }
+    const skipOnFailure = d.skipOnFailure ?? true;
+    if (d.kind === "send") nodes.push({ ...base, skipOnFailure, kind: "send", id: d.id, label: d.label, after, target: d.target, text: d.text });
+    else nodes.push({ ...base, skipOnFailure, kind: "create", id: d.id, label: d.label, after, create: d.create });
   }
   // Drafts are in order and each node may only depend on known ids; reject cycles.
   const visiting = new Set<string>();
@@ -217,7 +232,10 @@ export function buildNodes(drafts: readonly DraftNode[]): PlanNode[] {
   return nodes;
 }
 
-/** Pending nodes whose dependencies settled: ready to start, or to skip after a failed dependency. */
+/**
+ * Pending nodes whose dependencies settled: ready to start, or to skip after a failed dependency.
+ * A dependency waiting on quota is not settled, so a usage limit never causes a skip.
+ */
 export function settlePending(plan: Plan): { start: PlanNode[]; skip: PlanNode[] } {
   const state = new Map(plan.nodes.map((n) => [n.id, n.state]));
   const start: PlanNode[] = [];
@@ -225,8 +243,10 @@ export function settlePending(plan: Plan): { start: PlanNode[]; skip: PlanNode[]
   for (const n of plan.nodes) {
     if (n.state !== "pending") continue;
     const deps = n.after.map((a) => state.get(a)!);
-    if (deps.some((s) => s === "failed" || s === "skipped")) skip.push(n);
-    else if (deps.every((s) => s === "done")) start.push(n);
+    if (!deps.every(isTerminal)) continue;
+    const anyFailed = deps.some((s) => s === "failed" || s === "skipped");
+    if (anyFailed && n.skipOnFailure) skip.push(n);
+    else start.push(n);
   }
   return { start, skip };
 }

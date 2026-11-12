@@ -191,6 +191,7 @@ function PlanView({ s, plan, now }: { s: Styles; plan: Plan; now: number }) {
                 [{n.id}] {n.label}
               </Text>
               {n.after.length ? <Text style={s.muted}>← {n.after.join(", ")}</Text> : null}
+              {n.after.length && !n.skipOnFailure ? <Text style={s.muted}>(선행 실패해도 실행)</Text> : null}
             </View>
             {n.state === "waiting_quota" && n.quotaUntil ? (
               <Text style={s.muted}>
@@ -317,6 +318,7 @@ function EditorForm({ s, initial }: { s: Styles; initial: EditorDraft }) {
         provider: first ? `${first.provider}${first.model ? `/${first.model}` : ""}` : "claude",
         modeId: first?.modeId ?? "",
         title: "",
+        skipOnFailure: true,
       },
     ]);
   };
@@ -340,6 +342,7 @@ function EditorForm({ s, initial }: { s: Styles; initial: EditorDraft }) {
           target: { nodeId: f.target },
           text: f.text,
           label: `메시지 → ${nodeLabel(f.target)}`,
+          skipOnFailure: f.skipOnFailure,
         });
       } else {
         nodes.push({
@@ -354,6 +357,7 @@ function EditorForm({ s, initial }: { s: Styles; initial: EditorDraft }) {
             prompt: f.text,
           },
           label: `새 세션: ${f.title || f.cwd}`,
+          skipOnFailure: f.skipOnFailure,
         });
       }
     }
@@ -424,7 +428,10 @@ function EditorForm({ s, initial }: { s: Styles; initial: EditorDraft }) {
 
       <View style={s.card}>
         <Text style={s.h2}>2. 후속 작업</Text>
-        <Text style={s.muted}>선행 작업이 모두 완료되면 실행합니다. 선행 작업이 실패하면 건너뜁니다.</Text>
+        <Text style={s.muted}>
+          선행 작업이 모두 끝나면 실행합니다. 선행 작업이 실패했을 때 건너뛸지는 작업마다 정합니다. 토큰 한도로 멈춘 작업은
+          실패가 아니라 대기이므로, 재개되어 끝날 때까지 기다립니다.
+        </Text>
         {followUps.map((f, index) => {
           const earlier = [...watchIds, ...followUps.slice(0, index).map((x) => x.id)];
           const targets = [...watchIds, ...followUps.slice(0, index).filter((x) => x.kind === "create").map((x) => x.id)];
@@ -480,6 +487,16 @@ function EditorForm({ s, initial }: { s: Styles; initial: EditorDraft }) {
                 onChangeText={(v) => update(f.id, { text: v })}
                 placeholder={f.kind === "send" ? "보낼 메시지" : "첫 프롬프트"}
               />
+              <Pressable
+                accessibilityRole="checkbox"
+                accessibilityState={{ checked: f.skipOnFailure }}
+                accessibilityLabel="선행 작업이 실패하면 건너뛰기"
+                onPress={() => update(f.id, { skipOnFailure: !f.skipOnFailure })}
+                style={s.agentRow}
+              >
+                <View style={s.check(f.skipOnFailure)} />
+                <Text style={s.text}>선행 작업이 실패하면 건너뛰기</Text>
+              </Pressable>
             </View>
           );
         })}

@@ -212,3 +212,35 @@ test("a send to a busy agent waits for its current turn", async () => {
   await h.engine.tick();
   assert.deepEqual(h.calls, [["send", "b", "hi"]]);
 });
+
+test("with skipOnFailure off, a follow-up runs after its dependency fails", async () => {
+  const h = harness({ a: { status: "running" } });
+  await h.engine.start({
+    ...opts,
+    nodes: [
+      watch("w1", "a"),
+      { kind: "send", id: "f1", after: ["w1"], target: { nodeId: "w1" }, text: "다시 해", label: "f1", skipOnFailure: false },
+    ],
+  });
+  await h.finishTurn("a", { kind: "failed", message: "Claude run failed" });
+  assert.deepEqual(h.calls, [["send", "a", "다시 해"]]);
+  assert.equal(h.saved().nodes[1].state, "running");
+});
+
+test("a usage limit on a dependency is a wait, not a failure: dependents are not skipped", async () => {
+  const h = harness({ a: { status: "running" } });
+  await h.engine.start({
+    ...opts,
+    nodes: [watch("w1", "a"), { kind: "send", id: "f1", after: ["w1"], target: { nodeId: "w1" }, text: "검토해", label: "f1" }],
+  });
+  h.texts.set("a", "You've hit your limit · resets 3pm");
+  await h.finishTurn("a");
+  assert.deepEqual(state(h.saved()), { w1: "waiting_quota", f1: "pending" });
+  h.advance(h.saved().nodes[0].quotaUntil - h.now());
+  await h.engine.tick();
+  h.texts.set("a", "끝났습니다.");
+  h.advance(5 * 60_000);
+  await h.finishTurn("a");
+  assert.deepEqual(h.calls, [["send", "a", "continue"], ["send", "a", "검토해"]]);
+  assert.deepEqual(state(h.saved()), { w1: "done", f1: "running" });
+});
