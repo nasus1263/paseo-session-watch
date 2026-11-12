@@ -16,7 +16,7 @@
   ],
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --import ./test/ts-resolve.mjs --test test/limit.test.mjs test/engine.test.mjs"
+    "test": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --import ./test/ts-resolve.mjs --test test/limit.test.mjs test/engine.test.mjs test/store.test.mjs"
   },
   "devDependencies": {
     "@getpaseo/plugin": "0.15.4",

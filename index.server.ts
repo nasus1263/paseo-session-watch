@@ -2,8 +2,8 @@ import type { PaseoApi } from "@getpaseo/client";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import { Engine } from "./server/engine";
 import { listAgents, paseoGateway } from "./server/gateway";
-import { DEFAULT_PLAN_FILE, loadPlan, savePlan } from "./server/store";
-import { agentsRpc, cancelRpc, clearRpc, startRpc, stateRpc } from "./shared/plan";
+import { DEFAULT_PLAN_FILE, DRAFT_FILE, loadDraft, loadPlan, saveDraft, savePlan } from "./server/store";
+import { agentsRpc, cancelRpc, clearRpc, draftGetRpc, draftSetRpc, startRpc, stateRpc } from "./shared/plan";
 
 const TICK_MS = 30_000;
 
@@ -20,6 +20,18 @@ export default function contribute(server: PluginServerContext) {
     attach(paseo);
     await loaded;
     return { plan: engine.snapshot(), now: Date.now() };
+  });
+  // Draft writes share one temp file, so they run one at a time.
+  let draftWrites: Promise<unknown> = Promise.resolve();
+  server.handle(draftGetRpc, async () => {
+    await draftWrites;
+    return { draft: await loadDraft(DRAFT_FILE) };
+  });
+  server.handle(draftSetRpc, async ({ draft }) => {
+    const write = draftWrites.then(() => saveDraft(DRAFT_FILE, draft));
+    draftWrites = write.catch(() => undefined);
+    await write;
+    return {};
   });
   server.handle(agentsRpc, async (_input, { paseo }) => {
     attach(paseo);

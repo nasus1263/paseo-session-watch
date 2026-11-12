@@ -1,9 +1,24 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { Plan } from "../shared/plan";
+import { EditorDraft, EMPTY_DRAFT, Plan } from "../shared/plan";
 
-export const DEFAULT_PLAN_FILE = join(homedir(), ".paseo", "plugin-data", "paseo-session-watch", "plan.json");
+const DATA_DIR = join(homedir(), ".paseo", "plugin-data", "paseo-session-watch");
+export const DEFAULT_PLAN_FILE = join(DATA_DIR, "plan.json");
+export const DRAFT_FILE = join(DATA_DIR, "draft.json");
+
+export async function loadDraft(file: string): Promise<EditorDraft> {
+  try {
+    const parsed = EditorDraft.safeParse(JSON.parse(await readFile(file, "utf8")));
+    return parsed.success ? parsed.data : EMPTY_DRAFT;
+  } catch {
+    return EMPTY_DRAFT;
+  }
+}
+
+export async function saveDraft(file: string, draft: EditorDraft): Promise<void> {
+  await writeAtomic(file, JSON.stringify(draft, null, 2));
+}
 
 export async function loadPlan(file: string): Promise<Plan | null> {
   let raw: string;
@@ -22,8 +37,12 @@ export async function loadPlan(file: string): Promise<Plan | null> {
 
 /** Writes atomically so a crash never leaves a half-written plan. */
 export async function savePlan(file: string, plan: Plan | null): Promise<void> {
+  await writeAtomic(file, JSON.stringify(plan, null, 2));
+}
+
+async function writeAtomic(file: string, data: string): Promise<void> {
   await mkdir(dirname(file), { recursive: true });
   const tmp = `${file}.tmp`;
-  await writeFile(tmp, JSON.stringify(plan, null, 2), "utf8");
+  await writeFile(tmp, data, "utf8");
   await rename(tmp, file);
 }

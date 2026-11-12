@@ -1,16 +1,20 @@
 import type { PluginTheme } from "@getpaseo/plugin";
 import { useRpc, type PluginScreenProps } from "@getpaseo/plugin/client";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Pressable, ScrollView, Text, TextInput, View } from "react-native";
 import {
   agentsRpc,
   cancelRpc,
   clearRpc,
+  draftGetRpc,
+  draftSetRpc,
   startRpc,
   stateRpc,
   type AgentRow,
   type DraftNode,
+  type EditorDraft,
+  type FollowUpDraft,
   type NodeState,
   type Plan,
 } from "../shared/plan";
@@ -220,29 +224,65 @@ function PlanView({ s, plan, now }: { s: Styles; plan: Plan; now: number }) {
   );
 }
 
-interface FollowUp {
-  id: string;
-  kind: "send" | "create";
-  after: string[];
-  target: string; // node id of a watch or create node
-  text: string;
-  cwd: string;
-  provider: string;
-  modeId: string;
-  title: string;
+type FollowUp = FollowUpDraft;
+
+// Outside the ["watch"] prefix so plan refreshes never refetch it over local edits.
+const DRAFT_KEY = ["watch-draft"];
+const DRAFT_SAVE_DELAY_MS = 400;
+
+/** Loads the saved form first, so the editor always starts from what was last shown. */
+function Editor({ s }: { s: Styles }) {
+  const getDraft = useRpc(draftGetRpc);
+  const draft = useQuery({ queryKey: DRAFT_KEY, queryFn: () => getDraft({}), staleTime: Infinity });
+  if (draft.error) return <Text style={s.danger}>{String(draft.error)}</Text>;
+  if (!draft.data) return <Text style={s.muted}>불러오는 중…</Text>;
+  return <EditorForm s={s} initial={draft.data.draft} />;
 }
 
-function Editor({ s }: { s: Styles }) {
+/** Mirrors the form into the query cache at once and to the daemon shortly after; flushes on unmount. */
+function useDraftPersistence(draft: EditorDraft) {
+  const qc = useQueryClient();
+  const setDraft = useRpc(draftSetRpc);
+  const pending = useRef<EditorDraft | null>(null);
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const flush = useRef(() => {});
+  flush.current = () => {
+    if (timer.current) clearTimeout(timer.current);
+    timer.current = null;
+    const next = pending.current;
+    pending.current = null;
+    if (next) void setDraft({ draft: next }).catch((error) => console.error("초안 저장 실패", error));
+  };
+  const first = useRef(true);
+  useEffect(() => {
+    if (first.current) {
+      first.current = false;
+      return;
+    }
+    qc.setQueryData(DRAFT_KEY, { draft });
+    pending.current = draft;
+    if (timer.current) clearTimeout(timer.current);
+    timer.current = setTimeout(() => flush.current(), DRAFT_SAVE_DELAY_MS);
+  }, [draft, qc]);
+  useEffect(() => () => flush.current(), []);
+}
+
+function EditorForm({ s, initial }: { s: Styles; initial: EditorDraft }) {
   const qc = useQueryClient();
   const listAgents = useRpc(agentsRpc);
   const start = useRpc(startRpc);
   const agents = useQuery({ queryKey: ["watch", "agents"], queryFn: () => listAgents({}), refetchInterval: 5000 });
-  const [selected, setSelected] = useState<string[]>([]);
-  const [followUps, setFollowUps] = useState<FollowUp[]>([]);
-  const [shutdown, setShutdown] = useState(true);
-  const [resumeMessage, setResumeMessage] = useState("continue");
-  const [permissionMin, setPermissionMin] = useState("30");
-  const [seq, setSeq] = useState(1);
+  const [selected, setSelected] = useState<string[]>(initial.selected);
+  const [followUps, setFollowUps] = useState<FollowUp[]>(initial.followUps);
+  const [shutdown, setShutdown] = useState(initial.shutdown);
+  const [resumeMessage, setResumeMessage] = useState(initial.resumeMessage);
+  const [permissionMin, setPermissionMin] = useState(initial.permissionMin);
+  const [seq, setSeq] = useState(initial.seq);
+  const current = useMemo(
+    () => ({ selected, followUps, shutdown, resumeMessage, permissionMin, seq }),
+    [selected, followUps, shutdown, resumeMessage, permissionMin, seq],
+  );
+  useDraftPersistence(current);
 
   const rows = agents.data?.agents ?? [];
   const byId = new Map(rows.map((a) => [a.id, a]));

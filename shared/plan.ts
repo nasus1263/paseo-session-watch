@@ -114,6 +114,51 @@ export const clearRpc = defineRpc({
   output: z.object({}),
 });
 
+// The editor's unsaved form, kept on the daemon so it survives navigation and app restarts.
+export const FollowUpDraft = z.object({
+  id: z.string(),
+  kind: z.enum(["send", "create"]),
+  after: z.array(z.string()),
+  target: z.string(), // node id of a watch or create node
+  text: z.string(),
+  cwd: z.string(),
+  provider: z.string(),
+  modeId: z.string(),
+  title: z.string(),
+});
+export type FollowUpDraft = z.infer<typeof FollowUpDraft>;
+
+export const EditorDraft = z.object({
+  selected: z.array(z.string()),
+  followUps: z.array(FollowUpDraft),
+  shutdown: z.boolean(),
+  resumeMessage: z.string(),
+  permissionMin: z.string(),
+  seq: z.number(),
+});
+export type EditorDraft = z.infer<typeof EditorDraft>;
+
+export const EMPTY_DRAFT: EditorDraft = {
+  selected: [],
+  followUps: [],
+  shutdown: true,
+  resumeMessage: "continue",
+  permissionMin: "30",
+  seq: 1,
+};
+
+export const draftGetRpc = defineRpc({
+  name: "watch.draft.get",
+  input: z.object({}),
+  output: z.object({ draft: EditorDraft }),
+});
+
+export const draftSetRpc = defineRpc({
+  name: "watch.draft.set",
+  input: z.object({ draft: EditorDraft }),
+  output: z.object({}),
+});
+
 export const TERMINAL: readonly NodeState[] = ["done", "failed", "skipped"];
 export const isTerminal = (s: NodeState) => TERMINAL.includes(s);
 
