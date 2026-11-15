@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import type { PaseoApi } from "@getpaseo/client";
 import { exhaustedUntil } from "../shared/limit";
 import type { AgentRow } from "../shared/plan";
-import { claudeOutstandingTasks } from "./claude-sessions";
+import { claudeOutstandingTasks, claudeTranscriptAgeMs } from "./claude-sessions";
 import type { Gateway } from "./engine";
 
 const SHUTDOWN_COMMENT = "Paseo 세션 감시: 모든 작업이 끝나 60초 후 PC를 종료합니다.";
@@ -16,20 +16,30 @@ function run(file: string, args: string[]): Promise<void> {
   });
 }
 
+/** Paseo reports idle for turns it does not track (wake-ups, background notifications); a fresh transcript write means the session is working. */
+const ACTIVE_WRITE_WINDOW_MS = 45_000;
+
+async function effectiveStatus(provider: string, status: string, sessionId: string | null): Promise<string> {
+  if (provider !== "claude" || status !== "idle" || !sessionId) return status;
+  const age = await claudeTranscriptAgeMs(sessionId).catch(() => null);
+  return age !== null && age < ACTIVE_WRITE_WINDOW_MS ? "running" : status;
+}
+
 export function paseoGateway(paseo: PaseoApi): Gateway {
   return {
     async agent(id) {
       const result = await paseo.agents.ref(id).refresh();
       if (!result) return null;
       const a = result.agent;
+      const sessionId = a.runtimeInfo?.sessionId ?? a.persistence?.sessionId ?? null;
       return {
-        status: a.status,
+        status: await effectiveStatus(a.provider, a.status, sessionId),
         provider: a.provider,
         lastError: a.lastError ?? null,
         pendingPermissions: a.pendingPermissions?.length ?? 0,
         archived: Boolean(a.archivedAt),
         updatedAt: a.updatedAt ?? null,
-        sessionId: a.runtimeInfo?.sessionId ?? a.persistence?.sessionId ?? null,
+        sessionId,
       };
     },
 
@@ -82,20 +92,22 @@ export function paseoGateway(paseo: PaseoApi): Gateway {
 
 export async function listAgents(paseo: PaseoApi): Promise<AgentRow[]> {
   const result = await paseo.agents.list();
-  return result.entries
-    .map(({ agent }) => agent)
-    .filter((a) => !a.archivedAt && !a.internal)
-    .map((a) => ({
-      id: a.id,
-      title: a.title ?? a.id.slice(0, 8),
-      provider: a.provider,
-      model: a.model ?? null,
-      modeId: a.currentModeId ?? null,
-      status: a.status,
-      cwd: a.cwd,
-      lastActivityAt: a.updatedAt ?? null,
-    }))
-    .sort((x, y) => (y.lastActivityAt ?? "").localeCompare(x.lastActivityAt ?? ""));
+  const rows = await Promise.all(
+    result.entries
+      .map(({ agent }) => agent)
+      .filter((a) => !a.archivedAt && !a.internal)
+      .map(async (a) => ({
+        id: a.id,
+        title: a.title ?? a.id.slice(0, 8),
+        provider: a.provider,
+        model: a.model ?? null,
+        modeId: a.currentModeId ?? null,
+        status: await effectiveStatus(a.provider, a.status, a.runtimeInfo?.sessionId ?? a.persistence?.sessionId ?? null),
+        cwd: a.cwd,
+        lastActivityAt: a.updatedAt ?? null,
+      })),
+  );
+  return rows.sort((x, y) => (y.lastActivityAt ?? "").localeCompare(x.lastActivityAt ?? ""));
 }
 
 const PARENT_LABEL = "paseo.parent-agent-id";

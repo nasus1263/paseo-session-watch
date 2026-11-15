@@ -54,3 +54,15 @@ export async function claudeOutstandingTasks(sessionId: string): Promise<string[
   parsed.set(file, { size: info.size, mtimeMs: info.mtimeMs, outstanding });
   return outstanding;
 }
+
+/** Milliseconds since the Claude transcript was last written, or null when it is not readable. */
+export async function claudeTranscriptAgeMs(sessionId: string): Promise<number | null> {
+  const file = await locate(sessionId);
+  if (!file) return null;
+  try {
+    return Date.now() - (await stat(file)).mtimeMs;
+  } catch {
+    pathBySession.delete(sessionId);
+    return null;
+  }
+}
