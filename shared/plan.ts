@@ -50,6 +50,8 @@ export const Plan = z.object({
   createdAt: z.number(),
   status: z.enum(["active", "shutting_down", "finished", "canceled"]),
   shutdown: z.boolean(),
+  /** When false, a node that hits a token limit fails instead of waiting for the reset. */
+  waitForQuota: z.boolean().default(true),
   resumeMessage: z.string(),
   permissionTimeoutMin: z.number(),
   quietMin: z.number().default(3),
@@ -112,6 +114,7 @@ export const startRpc = defineRpc({
   input: z.object({
     nodes: z.array(DraftNode).min(1),
     shutdown: z.boolean(),
+    waitForQuota: z.boolean().default(true),
     resumeMessage: z.string().min(1),
     permissionTimeoutMin: z.number().min(1),
     quietMin: z.number().min(0),
@@ -151,6 +154,7 @@ export const EditorDraft = z.object({
   selected: z.array(z.string()),
   followUps: z.array(FollowUpDraft),
   shutdown: z.boolean(),
+  waitForQuota: z.boolean().default(true),
   resumeMessage: z.string(),
   permissionMin: z.string(),
   quietMin: z.string().default("3"),
@@ -163,6 +167,7 @@ export const EMPTY_DRAFT: EditorDraft = {
   selected: [],
   followUps: [],
   shutdown: true,
+  waitForQuota: true,
   resumeMessage: "continue",
   permissionMin: "30",
   quietMin: "3",

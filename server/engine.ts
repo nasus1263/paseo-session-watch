@@ -45,6 +45,7 @@ export interface Gateway {
 export interface StartInput {
   nodes: DraftNode[];
   shutdown: boolean;
+  waitForQuota?: boolean;
   resumeMessage: string;
   permissionTimeoutMin: number;
   quietMin: number;
@@ -107,6 +108,7 @@ export class Engine {
         createdAt: now,
         status: "active",
         shutdown: input.shutdown,
+        waitForQuota: input.waitForQuota ?? true,
         resumeMessage: input.resumeMessage,
         permissionTimeoutMin: input.permissionTimeoutMin,
         quietMin: input.quietMin,
@@ -316,6 +318,10 @@ export class Engine {
     }
     if (verdict === "failed") {
       this.fail(node, end.kind === "completed" ? "실패" : end.message);
+      return;
+    }
+    if (!this.plan!.waitForQuota) {
+      this.fail(node, "토큰 한도 도달(한도 대기 꺼짐)");
       return;
     }
     node.limitHits += 1;

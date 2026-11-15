@@ -386,3 +386,11 @@ test("follow-ups wait for the dependency to settle, not just for its turn to end
   await h.engine.tick();
   assert.deepEqual(h.calls, [["send", "a", "검토해"]]);
 });
+
+test("with waitForQuota off, a limit stop fails the node instead of waiting", async () => {
+  const h = harness({ a: { status: "running" } });
+  await h.engine.start({ ...opts, waitForQuota: false, nodes: [watch("w1", "a")] });
+  h.texts.set("a", "You've hit your limit · resets 3pm (Asia/Seoul)");
+  await h.finishTurn("a");
+  assert.equal(h.saved().nodes[0].state, "failed");
+});
