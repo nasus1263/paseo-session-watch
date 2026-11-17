@@ -1,6 +1,7 @@
 {
   "id": "paseo-session-watch",
   "name": "세션 감시",
+  "description": "Watches selected agent sessions, runs follow-up tasks, resumes after usage limits, and shuts down the PC when all finish.",
   "media": [],
   "requirements": {
     "paseo": ">=0.15.4"
