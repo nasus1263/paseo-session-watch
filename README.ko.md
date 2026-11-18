@@ -4,6 +4,8 @@
 
 고른 에이전트 세션이 모두 끝나면 PC를 종료하는 [Paseo](https://paseo.sh) 플러그인. 후속 작업을 의존 관계로 묶을 수 있고, 사용량 한도로 멈춘 세션은 자동 재개한다.
 
+![세션 감시 화면](docs/images/watch-screen.png)
+
 ## 설치
 
 ```bash

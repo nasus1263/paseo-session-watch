@@ -4,6 +4,8 @@
 
 A [Paseo](https://paseo.sh) plugin that watches selected agent sessions and shuts down the PC when they all finish. You can chain follow-up tasks, and sessions that hit a usage limit resume on their own.
 
+![Session watch screen](docs/images/watch-screen.png)
+
 ## Install
 
 ```bash
