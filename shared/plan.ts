@@ -52,6 +52,10 @@ export const Plan = z.object({
   shutdown: z.boolean(),
   /** When false, a node that hits a token limit fails instead of waiting for the reset. */
   waitForQuota: z.boolean().default(true),
+  /** When true, any session outside the plan that stops on a usage limit joins the plan and is resumed. */
+  reviveAll: z.boolean().default(false),
+  /** Last activity time already judged per agent by the reviveAll scan. */
+  reviveSeen: z.record(z.string(), z.string()).default({}),
   resumeMessage: z.string(),
   permissionTimeoutMin: z.number(),
   quietMin: z.number().default(3),
@@ -115,6 +119,7 @@ export const startRpc = defineRpc({
     nodes: z.array(DraftNode).min(1),
     shutdown: z.boolean(),
     waitForQuota: z.boolean().default(true),
+    reviveAll: z.boolean().default(false),
     resumeMessage: z.string().min(1),
     permissionTimeoutMin: z.number().min(1),
     quietMin: z.number().min(0),
@@ -155,6 +160,7 @@ export const EditorDraft = z.object({
   followUps: z.array(FollowUpDraft),
   shutdown: z.boolean(),
   waitForQuota: z.boolean().default(true),
+  reviveAll: z.boolean().default(false),
   resumeMessage: z.string(),
   permissionMin: z.string(),
   quietMin: z.string().default("3"),
@@ -168,6 +174,7 @@ export const EMPTY_DRAFT: EditorDraft = {
   followUps: [],
   shutdown: true,
   waitForQuota: true,
+  reviveAll: false,
   resumeMessage: "continue",
   permissionMin: "30",
   quietMin: "3",
@@ -199,6 +206,14 @@ export function nodeAgentId(plan: Plan, node: PlanNode): string | null {
   return other ? nodeAgentId(plan, other) : null;
 }
 
+const NODE_BASE = { settleSince: null, lastUpdatedAt: null, backgroundSince: null, agentId: null, state: "pending" as const, startedAt: null, resumedAt: null, quotaUntil: null, limitHits: 0, pendingPermissionSince: null, note: null };
+
+/** Watch node for a session outside the plan that reviveAll picked up; ids r1, r2, ... never clash with editor ids. */
+export function adoptedNode(plan: Plan, agentId: string, title: string): PlanNode {
+  const n = plan.nodes.filter((x) => /^r\d+$/.test(x.id)).length + 1;
+  return { ...NODE_BASE, skipOnFailure: true, kind: "watch", id: `r${n}`, label: `자동 재개: ${title}`, after: [], agentId, state: "running" };
+}
+
 /** Turns a draft into plan nodes: validates references and serialises turns on the same agent. */
 export function buildNodes(drafts: readonly DraftNode[]): PlanNode[] {
   const ids = new Set<string>();
@@ -206,7 +221,7 @@ export function buildNodes(drafts: readonly DraftNode[]): PlanNode[] {
     if (ids.has(d.id)) throw new Error(`중복된 노드 id: ${d.id}`);
     ids.add(d.id);
   }
-  const base = { settleSince: null, lastUpdatedAt: null, backgroundSince: null, agentId: null, state: "pending" as const, startedAt: null, resumedAt: null, quotaUntil: null, limitHits: 0, pendingPermissionSince: null, note: null };
+  const base = NODE_BASE;
   const nodes: PlanNode[] = [];
   // Agent key per node: a fixed agent id, or the creating node's id for agents made by the plan.
   const keyOf = new Map<string, string>();

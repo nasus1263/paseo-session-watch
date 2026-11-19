@@ -20,6 +20,11 @@ function harness(agents) {
     async activity(id) {
       return { background: background.get(id) ?? [], busyChildren: children.get(id) ?? [] };
     },
+    async list() {
+      return Object.entries(agents)
+        .filter(([, a]) => !a.internal && !a.archived)
+        .map(([id, a]) => ({ id, title: id, provider: "claude", model: null, modeId: null, status: a.status, cwd: "", lastActivityAt: a.updatedAt ?? null }));
+    },
     async lastAssistantText(id) {
       return texts.get(id) ?? null;
     },
@@ -47,6 +52,7 @@ function harness(agents) {
   engine.attach(gateway);
   return {
     engine,
+    agents,
     calls,
     texts,
     background,
@@ -393,4 +399,60 @@ test("with waitForQuota off, a limit stop fails the node instead of waiting", as
   h.texts.set("a", "You've hit your limit · resets 3pm (Asia/Seoul)");
   await h.finishTurn("a");
   assert.equal(h.saved().nodes[0].state, "failed");
+});
+
+const iso = (ms) => new Date(ms).toISOString();
+
+test("reviveAll: a session outside the plan stopped by a limit is resumed and blocks shutdown until it ends", async () => {
+  const h = harness({ a: { status: "running" }, x: { status: "running" } });
+  await h.engine.start({ ...opts, reviveAll: true, nodes: [watch("w1", "a")] });
+  h.texts.set("x", "You've hit your limit · resets 3pm");
+  h.setUsage(h.now() + 60 * 60_000);
+  await h.finishTurn("x");
+  const added = h.saved().nodes.find((n) => n.id === "r1");
+  assert.equal(added.state, "waiting_quota");
+  assert.equal(added.agentId, "x");
+  await h.finishTurn("a");
+  assert.equal(h.saved().status, "active");
+  h.setUsage(null);
+  h.texts.delete("x");
+  h.advance(63 * 60_000);
+  await h.engine.tick();
+  assert.deepEqual(h.calls, [["send", "x", "continue"]]);
+  await h.finishTurn("x");
+  assert.equal(h.saved().status, "shutting_down");
+});
+
+test("reviveAll off: a limit stop outside the plan is ignored", async () => {
+  const h = harness({ a: { status: "running" }, x: { status: "running" } });
+  await h.engine.start({ ...opts, nodes: [watch("w1", "a")] });
+  h.texts.set("x", "You've hit your limit");
+  await h.finishTurn("x");
+  assert.deepEqual(h.saved().nodes.map((n) => n.id), ["w1"]);
+});
+
+test("reviveAll needs waitForQuota", async () => {
+  const h = harness({ a: { status: "running" } });
+  const plan = await h.engine.start({ ...opts, waitForQuota: false, reviveAll: true, nodes: [watch("w1", "a")] });
+  assert.equal(plan.reviveAll, false);
+});
+
+test("reviveAll scan adopts a recently limited idle session the hook missed, but not internal or stale ones", async () => {
+  const h = harness({ a: { status: "running" } });
+  const agents = {
+    x: { status: "idle", updatedAt: iso(h.now() - 60_000) },
+    old: { status: "idle", updatedAt: iso(h.now() - 6 * 3_600_000) },
+    hidden: { status: "idle", updatedAt: iso(h.now()), internal: true },
+    fine: { status: "idle", updatedAt: iso(h.now()) },
+  };
+  for (const [id, a] of Object.entries(agents)) {
+    h.agents[id] = a;
+    if (id !== "fine") h.texts.set(id, "You've hit your limit");
+  }
+  await h.engine.start({ ...opts, reviveAll: true, nodes: [watch("w1", "a")] });
+  await h.engine.tick();
+  const adopted = h.saved().nodes.filter((n) => n.id.startsWith("r")).map((n) => n.agentId);
+  assert.deepEqual(adopted, ["x"]);
+  await h.engine.tick();
+  assert.equal(h.saved().nodes.length, 2);
 });

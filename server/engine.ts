@@ -1,11 +1,13 @@
 import { classifyTurnEnd, MAX_LIMIT_HITS, resumeAt, type TurnEnd } from "../shared/limit";
 import {
+  adoptedNode,
   buildNodes,
   isTerminal,
   nodeAgentId,
   settlePending,
   type DraftNode,
   type Plan,
+  type AgentRow,
   type PlanNode,
 } from "../shared/plan";
 
@@ -19,6 +21,9 @@ export interface AgentInfo {
   updatedAt: string | null;
   /** Provider session id (Claude transcript name), when known. */
   sessionId: string | null;
+  title?: string | null;
+  /** Paseo's own helper agents; never adopted by reviveAll. */
+  internal?: boolean;
 }
 
 /** Work that can outlive a turn: provider background tasks and Paseo child agents. */
@@ -32,6 +37,8 @@ export interface Activity {
 /** Everything the engine needs from Paseo and the OS. */
 export interface Gateway {
   agent(id: string): Promise<AgentInfo | null>;
+  /** Visible (not archived, not internal) agents with their effective status. */
+  list(): Promise<AgentRow[]>;
   lastAssistantText(id: string): Promise<string | null>;
   send(id: string, text: string): Promise<void>;
   create(spec: { cwd: string; provider: string; modeId?: string; title?: string; prompt: string }): Promise<string>;
@@ -46,6 +53,7 @@ export interface StartInput {
   nodes: DraftNode[];
   shutdown: boolean;
   waitForQuota?: boolean;
+  reviveAll?: boolean;
   resumeMessage: string;
   permissionTimeoutMin: number;
   quietMin: number;
@@ -56,6 +64,8 @@ export const SHUTDOWN_DELAY_MS = 60_000;
 /** A turn we just started may still read idle for a moment; trust snapshots only after this. */
 const START_GRACE_MS = 60_000;
 const MAX_LOG = 300;
+/** reviveAll also adopts sessions limited shortly before the plan started: one usage window back. */
+export const REVIVE_LOOKBACK_MS = 5 * 3_600_000;
 
 const isBusy = (status: string) => status === "running" || status === "initializing";
 
@@ -109,6 +119,9 @@ export class Engine {
         status: "active",
         shutdown: input.shutdown,
         waitForQuota: input.waitForQuota ?? true,
+        // Reviving means waiting for the quota, so it needs waitForQuota.
+        reviveAll: (input.reviveAll ?? false) && (input.waitForQuota ?? true),
+        reviveSeen: {},
         resumeMessage: input.resumeMessage,
         permissionTimeoutMin: input.permissionTimeoutMin,
         quietMin: input.quietMin,
@@ -117,7 +130,9 @@ export class Engine {
         nodes: buildNodes(input.nodes),
         log: [],
       };
-      this.log(`계획 시작: 노드 ${this.plan.nodes.length}개, PC 종료 ${input.shutdown ? "켬" : "끔"}`);
+      this.log(
+        `계획 시작: 노드 ${this.plan.nodes.length}개, PC 종료 ${input.shutdown ? "켬" : "끔"}, 모든 세션 한도 재개 ${this.plan.reviveAll ? "켬" : "끔"}`,
+      );
       await this.advance();
       await this.save();
       return this.plan;
@@ -154,8 +169,8 @@ export class Engine {
   onTurnEnd(agentId: string, provider: string, end: TurnEnd): Promise<void> {
     return this.run(async () => {
       const node = this.runningNodeFor(agentId);
-      if (!node) return;
-      await this.finishNode(node, provider, end);
+      if (node) await this.finishNode(node, provider, end);
+      else if (!(await this.adoptIfLimited(agentId, end))) return;
       await this.advance();
       await this.save();
     });
@@ -195,6 +210,9 @@ export class Engine {
         else if (node.state === "waiting_quota" && node.quotaUntil !== null && now >= node.quotaUntil) {
           await this.tryResume(node, now);
         }
+      }
+      if (plan.reviveAll) {
+        await this.scanLimited().catch((error) => this.log(`한도 세션 점검 실패: ${describe(error)}`));
       }
       await this.advance();
       await this.save();
@@ -288,6 +306,41 @@ export class Engine {
     const note = reasons.length > 0 ? `종료 확인 중: ${reasons.join(", ")}` : `종료 확인 중: ${left}분 더 조용하면 완료`;
     if (reasons.length > 0 && note !== node.note) this.log(`${node.label}: ${note}`);
     node.note = note;
+  }
+
+  /**
+   * reviveAll: a session outside the plan that stopped on a usage limit becomes a plan node,
+   * so it is resumed after the reset and the plan only finishes once it ends on its own.
+   */
+  private async adoptIfLimited(agentId: string, end: TurnEnd | null): Promise<boolean> {
+    const plan = this.plan;
+    const gw = this.gateway!;
+    if (!plan || plan.status !== "active" || !plan.reviveAll || this.activeNodeFor(agentId)) return false;
+    const info = await gw.agent(agentId);
+    if (!info || info.archived || info.internal) return false;
+    // Right after a hook the snapshot may still read busy; without a hook a busy agent is not stopped.
+    if (!end && (isBusy(info.status) || info.pendingPermissions > 0)) return false;
+    const turnEnd = end ?? endFromSnapshot(info);
+    const text = await gw.lastAssistantText(agentId).catch(() => null);
+    if (classifyTurnEnd(turnEnd, text) !== "limit") return false;
+    const node = adoptedNode(plan, agentId, info.title ?? agentId);
+    plan.nodes.push(node);
+    this.log(`${node.label}: 계획 밖 세션이 한도로 멈춰 [${node.id}]로 추가`);
+    await this.finishNode(node, info.provider, turnEnd);
+    return true;
+  }
+
+  /** Catches limit stops the turn hook missed: checks each agent once per new activity. */
+  private async scanLimited() {
+    const plan = this.plan!;
+    const from = plan.createdAt - REVIVE_LOOKBACK_MS;
+    for (const row of await this.gateway!.list()) {
+      const at = row.lastActivityAt;
+      if (isBusy(row.status) || row.status === "closed") continue;
+      if (!at || Date.parse(at) < from || plan.reviveSeen[row.id] === at || this.activeNodeFor(row.id)) continue;
+      await this.adoptIfLimited(row.id, null);
+      plan.reviveSeen[row.id] = at;
+    }
   }
 
   /** Back to running from settling; the next turn end is judged from scratch. */
@@ -462,6 +515,16 @@ export class Engine {
     if (!plan || plan.status !== "active") return undefined;
     return plan.nodes.find(
       (n) => (n.state === "running" || n.state === "settling") && nodeAgentId(plan, n) === agentId,
+    );
+  }
+
+  /** A node still responsible for this agent: one that is running, settling, or waiting on quota. */
+  private activeNodeFor(agentId: string): PlanNode | undefined {
+    const plan = this.plan!;
+    return plan.nodes.find(
+      (n) =>
+        (n.state === "running" || n.state === "settling" || n.state === "waiting_quota") &&
+        nodeAgentId(plan, n) === agentId,
     );
   }
 

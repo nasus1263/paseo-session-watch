@@ -40,8 +40,12 @@ export function paseoGateway(paseo: PaseoApi): Gateway {
         archived: Boolean(a.archivedAt),
         updatedAt: a.updatedAt ?? null,
         sessionId,
+        title: a.title ?? null,
+        internal: Boolean(a.internal),
       };
     },
+
+    list: () => listAgents(paseo),
 
     async lastAssistantText(id) {
       const page = await paseo.agents.ref(id).timeline.refetch({ direction: "tail", limit: 30 });

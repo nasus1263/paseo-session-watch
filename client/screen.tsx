@@ -172,7 +172,8 @@ function PlanView({ s, plan, now }: { s: Styles; plan: Plan; now: number }) {
       <View style={s.row}>
         <Text style={s.h2}>현재 계획: {PLAN_LABEL[plan.status]}</Text>
         <Text style={s.muted}>
-          PC 종료 {plan.shutdown ? "켬" : "끔"} · 한도 대기 {plan.waitForQuota ? "켬" : "끔"} · 재개 메시지 “{plan.resumeMessage}” · 권한 대기 {plan.permissionTimeoutMin}분 · 조용한 시간 {plan.quietMin}분 · 백그라운드 최대 {plan.backgroundMaxMin}분
+          PC 종료 {plan.shutdown ? "켬" : "끔"} · 한도 대기 {plan.waitForQuota ? "켬" : "끔"}
+          {plan.waitForQuota ? ` (모든 세션 ${plan.reviveAll ? "켬" : "끔"})` : ""} · 재개 메시지 “{plan.resumeMessage}” · 권한 대기 {plan.permissionTimeoutMin}분 · 조용한 시간 {plan.quietMin}분 · 백그라운드 최대 {plan.backgroundMaxMin}분
         </Text>
       </View>
       {plan.status === "shutting_down" && plan.shutdownAt ? (
@@ -278,14 +279,15 @@ function EditorForm({ s, initial }: { s: Styles; initial: EditorDraft }) {
   const [followUps, setFollowUps] = useState<FollowUp[]>(initial.followUps);
   const [shutdown, setShutdown] = useState(initial.shutdown);
   const [waitForQuota, setWaitForQuota] = useState(initial.waitForQuota);
+  const [reviveAll, setReviveAll] = useState(initial.reviveAll);
   const [resumeMessage, setResumeMessage] = useState(initial.resumeMessage);
   const [permissionMin, setPermissionMin] = useState(initial.permissionMin);
   const [quietMin, setQuietMin] = useState(initial.quietMin);
   const [backgroundMaxMin, setBackgroundMaxMin] = useState(initial.backgroundMaxMin);
   const [seq, setSeq] = useState(initial.seq);
   const current = useMemo(
-    () => ({ selected, followUps, shutdown, waitForQuota, resumeMessage, permissionMin, quietMin, backgroundMaxMin, seq }),
-    [selected, followUps, shutdown, waitForQuota, resumeMessage, permissionMin, quietMin, backgroundMaxMin, seq],
+    () => ({ selected, followUps, shutdown, waitForQuota, reviveAll, resumeMessage, permissionMin, quietMin, backgroundMaxMin, seq }),
+    [selected, followUps, shutdown, waitForQuota, reviveAll, resumeMessage, permissionMin, quietMin, backgroundMaxMin, seq],
   );
   useDraftPersistence(current);
 
@@ -386,7 +388,7 @@ function EditorForm({ s, initial }: { s: Styles; initial: EditorDraft }) {
 
   const startM = useMutation({
     mutationFn: () =>
-      start({ nodes: draft(), shutdown, waitForQuota, resumeMessage: resumeMessage.trim(), permissionTimeoutMin: minutes,
+      start({ nodes: draft(), shutdown, waitForQuota, reviveAll: waitForQuota && reviveAll, resumeMessage: resumeMessage.trim(), permissionTimeoutMin: minutes,
         quietMin: quiet,
         backgroundMaxMin: backgroundMax,
       }),
@@ -538,6 +540,20 @@ function EditorForm({ s, initial }: { s: Styles; initial: EditorDraft }) {
         >
           <View style={s.check(waitForQuota)} />
           <Text style={s.text}>토큰 한도에 도달하면 초기화까지 기다림 (끄면 그 작업은 실패 처리)</Text>
+        </Pressable>
+        <Pressable
+          accessibilityRole="checkbox"
+          accessibilityState={{ checked: waitForQuota && reviveAll, disabled: !waitForQuota }}
+          accessibilityLabel="감시 대상이 아닌 세션도 한도로 멈추면 재개"
+          disabled={!waitForQuota}
+          onPress={() => setReviveAll(!reviveAll)}
+          style={[s.agentRow, { marginLeft: 28, opacity: waitForQuota ? 1 : 0.5 }]}
+        >
+          <View style={s.check(waitForQuota && reviveAll)} />
+          <Text style={[s.text, { flex: 1 }]}>
+            감시 대상이 아닌 세션도 포함: 어떤 세션이든 한도로 멈추면 계획에 추가해 초기화 후 재개하고, 세션이 스스로 끝낼
+            때까지 완료로 보지 않음
+          </Text>
         </Pressable>
         <Text style={s.muted}>한도 초기화 후 보낼 재개 메시지</Text>
         <TextInput style={s.input} value={resumeMessage} onChangeText={setResumeMessage} />
