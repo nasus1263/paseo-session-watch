@@ -172,7 +172,7 @@ function PlanView({ s, plan, now }: { s: Styles; plan: Plan; now: number }) {
       <View style={s.row}>
         <Text style={s.h2}>현재 계획: {PLAN_LABEL[plan.status]}</Text>
         <Text style={s.muted}>
-          PC 종료 {plan.shutdown ? "켬" : "끔"} · 한도 대기 {plan.waitForQuota ? "켬" : "끔"}
+          {plan.untilCanceled ? "취소할 때까지 계속 · " : ""}PC 종료 {plan.shutdown ? "켬" : "끔"} · 한도 대기 {plan.waitForQuota ? "켬" : "끔"}
           {plan.waitForQuota ? ` (모든 세션 ${plan.reviveAll ? "켬" : "끔"})` : ""} · 재개 메시지 “{plan.resumeMessage}” · 권한 대기 {plan.permissionTimeoutMin}분 · 조용한 시간 {plan.quietMin}분 · 백그라운드 최대 {plan.backgroundMaxMin}분
         </Text>
       </View>
@@ -183,6 +183,7 @@ function PlanView({ s, plan, now }: { s: Styles; plan: Plan; now: number }) {
         </View>
       ) : null}
       <View style={s.card}>
+        {plan.nodes.length === 0 ? <Text style={s.muted}>아직 한도로 멈춘 세션이 없습니다</Text> : null}
         {plan.nodes.map((n) => (
           <View key={n.id} style={{ gap: 2, paddingVertical: 4 }}>
             <View style={s.row}>
@@ -384,11 +385,12 @@ function EditorForm({ s, initial }: { s: Styles; initial: EditorDraft }) {
   const backgroundMax = Number(backgroundMaxMin);
   if (!(backgroundMax >= 1)) problems.push("백그라운드 작업 최대 대기는 1분 이상이어야 합니다");
   if (!resumeMessage.trim()) problems.push("재개 메시지를 입력하세요");
-  const empty = selected.length === 0 && followUps.length === 0;
+  const reviveOnly = selected.length === 0 && followUps.length === 0;
+  const empty = reviveOnly && !(waitForQuota && reviveAll);
 
   const startM = useMutation({
     mutationFn: () =>
-      start({ nodes: draft(), shutdown, waitForQuota, reviveAll: waitForQuota && reviveAll, resumeMessage: resumeMessage.trim(), permissionTimeoutMin: minutes,
+      start({ nodes: draft(), shutdown: shutdown && !reviveOnly, waitForQuota, reviveAll: waitForQuota && reviveAll, resumeMessage: resumeMessage.trim(), permissionTimeoutMin: minutes,
         quietMin: quiet,
         backgroundMaxMin: backgroundMax,
       }),
@@ -531,6 +533,11 @@ function EditorForm({ s, initial }: { s: Styles; initial: EditorDraft }) {
           <View style={s.check(shutdown)} />
           <Text style={s.text}>모든 작업이 끝나면 PC 종료 (60초 유예, 취소 가능)</Text>
         </Pressable>
+        {reviveOnly && waitForQuota && reviveAll ? (
+          <Text style={s.muted}>
+            감시할 세션과 후속 작업이 없으면 한도로 멈춘 세션 재개만 하며, 취소할 때까지 계속합니다. 이때 PC 종료는 하지 않습니다.
+          </Text>
+        ) : null}
         <Pressable
           accessibilityRole="checkbox"
           accessibilityState={{ checked: waitForQuota }}

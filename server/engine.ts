@@ -112,16 +112,20 @@ export class Engine {
       if (this.plan && (this.plan.status === "active" || this.plan.status === "shutting_down")) {
         throw new Error("이미 진행 중인 계획이 있습니다. 먼저 취소하세요.");
       }
+      const reviveAll = (input.reviveAll ?? false) && (input.waitForQuota ?? true);
+      const untilCanceled = input.nodes.length === 0;
+      if (untilCanceled && !reviveAll) throw new Error("감시할 세션이나 후속 작업을 하나 이상 추가하세요.");
       const now = this.now();
       this.plan = {
         id: `plan-${now}`,
         createdAt: now,
         status: "active",
-        shutdown: input.shutdown,
+        shutdown: input.shutdown && !untilCanceled,
         waitForQuota: input.waitForQuota ?? true,
         // Reviving means waiting for the quota, so it needs waitForQuota.
-        reviveAll: (input.reviveAll ?? false) && (input.waitForQuota ?? true),
+        reviveAll,
         reviveSeen: {},
+        untilCanceled,
         resumeMessage: input.resumeMessage,
         permissionTimeoutMin: input.permissionTimeoutMin,
         quietMin: input.quietMin,
@@ -131,7 +135,9 @@ export class Engine {
         log: [],
       };
       this.log(
-        `계획 시작: 노드 ${this.plan.nodes.length}개, PC 종료 ${input.shutdown ? "켬" : "끔"}, 모든 세션 한도 재개 ${this.plan.reviveAll ? "켬" : "끔"}`,
+        untilCanceled
+          ? "계획 시작: 감시 세션 없이 한도로 멈춘 세션 재개만 합니다(취소할 때까지 계속, PC 종료 안 함)"
+          : `계획 시작: 노드 ${this.plan.nodes.length}개, PC 종료 ${input.shutdown ? "켬" : "끔"}, 모든 세션 한도 재개 ${reviveAll ? "켬" : "끔"}`,
       );
       await this.advance();
       await this.save();
@@ -445,7 +451,7 @@ export class Engine {
         if (node.state !== before) changed = true;
       }
     }
-    if (plan.nodes.every((n) => isTerminal(n.state))) await this.complete();
+    if (!plan.untilCanceled && plan.nodes.every((n) => isTerminal(n.state))) await this.complete();
   }
 
   private async startNode(node: PlanNode) {

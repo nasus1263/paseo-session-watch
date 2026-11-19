@@ -28,6 +28,7 @@ When every task is done, it runs `shutdown /s /t 60`.
 - **It shuts down your PC.** To cancel, click **PC 종료 취소** or run `shutdown /a` within 60 seconds.
 - When a session hits a usage limit, the plugin waits until the reset time and sends `continue`. If the reset time is unknown, it checks again every 30 minutes.
 - With the sub-option "Include sessions outside the plan", any session that stops on a usage limit while the plan runs is added to the plan and resumed the same way; the plan does not finish until that session ends on its own.
+- With that sub-option on, you can start without selecting any session. The plan then only revives limited sessions until you cancel it and never shuts down the PC.
 - Limit detection matches Claude's reply text (for example, "You've hit your limit"). If the provider changes the wording, detection can miss.
 - These end a task as failed: errors, cancellations, and permission waits longer than 30 minutes (configurable). Tasks that depend on a failed task are skipped.
 - The plan is saved in `~/.paseo/plugin-data/paseo-session-watch/plan.json` and survives restarts. After a restart, polling resumes once an app connects or an agent event occurs.

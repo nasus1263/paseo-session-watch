@@ -431,6 +431,30 @@ test("reviveAll off: a limit stop outside the plan is ignored", async () => {
   assert.deepEqual(h.saved().nodes.map((n) => n.id), ["w1"]);
 });
 
+test("reviveAll with no nodes runs until canceled and never shuts down", async () => {
+  const h = harness({ x: { status: "running" } });
+  const plan = await h.engine.start({ ...opts, reviveAll: true, nodes: [] });
+  assert.equal(plan.status, "active");
+  assert.equal(plan.shutdown, false);
+  h.texts.set("x", "You've hit your limit");
+  await h.finishTurn("x");
+  assert.equal(h.saved().nodes[0].state, "waiting_quota");
+  h.texts.delete("x");
+  h.advance(31 * 60_000);
+  await h.engine.tick();
+  await h.finishTurn("x");
+  assert.equal(h.saved().nodes[0].state, "done");
+  assert.equal(h.saved().status, "active");
+  assert.deepEqual(h.calls, [["send", "x", "continue"]]);
+  await h.engine.cancel();
+  assert.equal(h.saved().status, "canceled");
+});
+
+test("an empty plan without reviveAll is rejected", async () => {
+  const h = harness({});
+  await assert.rejects(h.engine.start({ ...opts, nodes: [] }));
+});
+
 test("reviveAll needs waitForQuota", async () => {
   const h = harness({ a: { status: "running" } });
   const plan = await h.engine.start({ ...opts, waitForQuota: false, reviveAll: true, nodes: [watch("w1", "a")] });

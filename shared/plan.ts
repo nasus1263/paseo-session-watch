@@ -56,6 +56,8 @@ export const Plan = z.object({
   reviveAll: z.boolean().default(false),
   /** Last activity time already judged per agent by the reviveAll scan. */
   reviveSeen: z.record(z.string(), z.string()).default({}),
+  /** Started with no nodes, only to revive limited sessions: never completes, runs until canceled. */
+  untilCanceled: z.boolean().default(false),
   resumeMessage: z.string(),
   permissionTimeoutMin: z.number(),
   quietMin: z.number().default(3),
@@ -116,7 +118,7 @@ export const agentsRpc = defineRpc({
 export const startRpc = defineRpc({
   name: "watch.start",
   input: z.object({
-    nodes: z.array(DraftNode).min(1),
+    nodes: z.array(DraftNode),
     shutdown: z.boolean(),
     waitForQuota: z.boolean().default(true),
     reviveAll: z.boolean().default(false),
